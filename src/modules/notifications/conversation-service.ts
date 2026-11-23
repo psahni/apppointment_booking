@@ -3,6 +3,7 @@ import { and, eq, gt } from "drizzle-orm";
 import { z } from "zod";
 import type { ApplicationDatabase } from "@/db/connection";
 import { patientSession, patientUser } from "@/db/schema/auth";
+import { appointments, bookingRequests } from "@/db/schema/booking";
 import { whatsappConversations, whatsappWebhookMessages } from "@/db/schema/notifications";
 import { readClinicConfiguration } from "@/modules/clinic/repository";
 import type { createBookingService } from "@/modules/booking/service";
@@ -50,6 +51,31 @@ export function createWhatsAppConversationService(
 ) {
   const vault = createWhatsAppConversationVault(encodedKey);
 
+  async function clinicContact() {
+    const clinic = await readClinicConfiguration(db);
+    return clinic?.phone ? `Clinic support: ${clinic.phone}`
+      : clinic?.email ? `Clinic support: ${clinic.email}` : "";
+  }
+
+  function withClinicContact(body: string, contact: string) {
+    return text(contact ? `${body}\n\n${contact}` : body);
+  }
+
+  async function completedAppointment(data: Data) {
+    if (!data.patientUserId || !data.requestId) return undefined;
+    // The request record also identifies bookings completed before this reply changed.
+    const [appointment] = await db.select({
+      id: appointments.id, startsAt: appointments.startsAt, timezone: appointments.timezone, status: appointments.status,
+    }).from(bookingRequests).innerJoin(appointments, eq(appointments.id, bookingRequests.appointmentId))
+      .where(and(eq(bookingRequests.actorKind, "patient"), eq(bookingRequests.actorId, data.patientUserId),
+        eq(bookingRequests.requestId, data.requestId), eq(appointments.whatsappNumberVerified, true))).limit(1);
+    return appointment;
+  }
+
+  function confirmationBody(visit: { id: string; startsAt: string; timezone: string }) {
+    return `Your appointment is confirmed for ${shortTime(visit.startsAt, visit.timezone)} (${visit.timezone}). Reference: ${visit.id.slice(0, 8)}.`;
+  }
+
   async function dateChoices(startDate?: string) {
     const first = await slots.read(startDate);
     if (!first.configured || first.noAvailableDates) return { first, days: [] as { date: string; available: number }[] };
@@ -90,7 +116,11 @@ export function createWhatsAppConversationService(
 
     if (existing.duplicate) {
       if (existing.data.lastInboundId === messageId && existing.data.lastReply) {
-        try { await sender.send(phone, existing.data.lastReply); }
+        const cached = existing.data.lastReply;
+        try {
+          await sender.send(phone, existing.state === "BOOKING_COMPLETED" && cached.type === "buttons"
+            ? withClinicContact(cached.body, await clinicContact()) : cached);
+        }
         catch { throw new Error("WHATSAPP_REPLY_FAILED"); }
       }
       return null;
@@ -98,7 +128,18 @@ export function createWhatsAppConversationService(
     let { state, data } = existing;
     const normalized = incoming.trim(), command = normalized.toLowerCase();
     let reply: ConversationMessage;
-    if (["cancel", "restart", "menu", "start over"].includes(command) || normalized === "cancel_booking") {
+    if (state === "BOOKING_COMPLETED") {
+      const appointment = await completedAppointment(data);
+      if (appointment?.status === "cancelled") {
+        state = "MAIN_MENU"; data = { phone }; reply = menu();
+      } else if (["cancel", "cancel appointment", "cancel my appointment", "cancel_booking"].includes(command)) {
+        reply = withClinicContact("You can cancel your appointment in My appointments on the booking website or contact the clinic.", await clinicContact());
+      } else {
+        reply = withClinicContact(appointment?.status === "confirmed"
+          ? confirmationBody({ ...appointment, startsAt: appointment.startsAt.toISOString() })
+          : "Your booking is complete.", await clinicContact());
+      }
+    } else if (["cancel", "restart", "menu", "start over"].includes(command) || normalized === "cancel_booking") {
       state = "MAIN_MENU"; data = { phone }; reply = menu();
     } else if (state === "MAIN_MENU") {
       if (command === "hi" || command === "hello" || command === "hey" || command === "menu" || command === "start") reply = menu();
@@ -177,22 +218,19 @@ export function createWhatsAppConversationService(
       if (normalized === "confirm_updates" || normalized === "confirm_no_updates") {
         if (!data.patientUserId || !data.patientSessionId || !data.requestId || !data.startsAt || !data.name) { state = "MAIN_MENU"; data = { phone }; reply = menu(); }
         else {
+          const contact = await clinicContact();
           try {
             const receipt = await booking.bookForWhatsApp({ userId: data.patientUserId, sessionId: data.patientSessionId }, {
               requestId: data.requestId, startsAt: data.startsAt, name: data.name, phone, whatsappConsent: normalized === "confirm_updates",
             });
             state = "BOOKING_COMPLETED";
-            reply = { type: "buttons", body: `Your appointment is confirmed for ${shortTime(receipt.startsAt, receipt.timezone)} (${receipt.timezone}). Reference: ${receipt.id.slice(0, 8)}.`, buttons: [{ id: "book", title: "Book another" }, { id: "support", title: "Contact support" }] };
+            reply = withClinicContact(confirmationBody(receipt), contact);
           } catch {
             state = "SELECTING_DATE"; const choices = await dateChoices();
             reply = choices.days.length ? text("That time is no longer available. Please choose another date.") : text("We could not confirm that time and no other times are available. Please contact the clinic.");
           }
         }
       } else reply = text("Choose Confirm + updates, Confirm only, or Cancel.");
-    } else if (state === "BOOKING_COMPLETED") {
-      if (normalized === "book" || normalized === "book_appointment") { state = "WAITING_FOR_NAME"; data = { phone }; reply = text("What name should we use for your appointment? Send Cancel to return to the main menu."); }
-      else if (normalized === "support" || normalized === "contact_support") { state = "MAIN_MENU"; data = { phone }; reply = menu(); }
-      else reply = text("Your booking is complete. Send Book to start another booking, or Support for clinic contact details.");
     } else { state = "MAIN_MENU"; data = { phone }; reply = menu(); }
 
     data.lastInboundId = messageId; data.lastReply = reply;

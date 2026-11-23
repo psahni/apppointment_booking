@@ -241,6 +241,9 @@ describe("WhatsApp conversational booking", () => {
 
   it("verifies email, books through the shared transaction and safely replays a webhook", async () => {
     const email = `wa-${randomUUID()}@example.test`, phone = "+919876543210";
+    const cfg = configuration();
+    cfg.phone = "+911234567890";
+    await clinic.save(credentials.admin, cfg);
     const waBooking = createBookingService(database.db, { ...identity.access, requirePatientAccess: createPatientBookingAccess(identity.patient) }, protection, clock, whatsappBookingEvents);
     const send = vi.fn(async () => {});
     const flow = createWhatsAppConversationService(database.db, waBooking, createSlotAvailabilityService(database.db, clock), identity.patient, { send }, protectionKey, clock);
@@ -258,6 +261,7 @@ describe("WhatsApp conversational booking", () => {
     const confirmationId = randomUUID();
     const confirmed = await flow.process(phone, confirmationId, "confirm_updates");
     expect(confirmed?.state).toBe("BOOKING_COMPLETED");
+    expect(confirmed?.reply).toEqual({ type: "text", body: expect.stringMatching(/appointment is confirmed[\s\S]*Clinic support: \+911234567890/) });
     expect(await database.db.select({ id: appointments.id }).from(appointments).where(eq(appointments.source, "patient"))).toHaveLength(1);
     const [appointment] = await database.db.select().from(appointments).where(eq(appointments.source, "patient"));
     expect(protection.decrypt(appointment.id, appointment.contactCiphertext)).toMatchObject({ name: "Synthetic WhatsApp Patient", email, phone });
@@ -267,6 +271,13 @@ describe("WhatsApp conversational booking", () => {
     expect(await flow.process(phone, confirmationId, "confirm_updates")).toBeNull();
     expect(send).toHaveBeenCalledTimes(replyCount + 1);
     expect(await database.db.select({ id: appointments.id }).from(appointments).where(eq(appointments.source, "patient"))).toHaveLength(1);
+    for (const command of ["book", "support", "menu", "restart", "cancel_booking"]) {
+      expect(await inbound(command)).toMatchObject({ state: "BOOKING_COMPLETED", reply: { type: "text" } });
+    }
+    expect((await inbound("Cancel my appointment"))?.reply.body).toContain("My appointments");
+    const doctor = createDoctorAppointmentsService(database.db, identity.access, () => protection, clock);
+    await doctor.cancel(credentials.admin, doctorInput(appointment.id));
+    expect(await inbound("Hi")).toMatchObject({ state: "MAIN_MENU", reply: { type: "buttons" } });
   });
 
   it("queues one post-commit cancellation notice only for an opted-in verified WhatsApp number", async () => {
