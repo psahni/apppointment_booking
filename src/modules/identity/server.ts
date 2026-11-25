@@ -4,6 +4,7 @@ import { readAuthEnvironment } from "@/platform/env";
 import { unconfiguredMailer } from "@/platform/mail";
 import { createLocalAuthMailer } from "@/platform/local-auth-mailer";
 import { createIdentity } from "./create-auth";
+import { mapleDemoEnabled } from "./maple-demo";
 
 let identity: ReturnType<typeof createIdentity> | undefined;
 
@@ -13,7 +14,8 @@ export function getIdentity() {
     const env = readAuthEnvironment();
     const { db } = getDatabase();
     identity = createIdentity({ db, baseURL: env.APP_URL, patientSecret: env.PATIENT_AUTH_SECRET, staffSecret: env.STAFF_AUTH_SECRET,
-      mailer: env.LOCAL_AUTH_EMAIL_PREVIEW ? createLocalAuthMailer() : unconfiguredMailer, testMode: env.AUTH_TEST_MODE });
+      mailer: env.LOCAL_AUTH_EMAIL_PREVIEW ? createLocalAuthMailer() : unconfiguredMailer, testMode: env.AUTH_TEST_MODE,
+      patientDemoMode: mapleDemoEnabled() });
   }
   return identity;
 }
