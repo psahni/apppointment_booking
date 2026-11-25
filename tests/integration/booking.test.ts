@@ -1,5 +1,5 @@
 import { createPostBookingLocalEmail, localBookingEmailEnabled, localEmailBookingEvents } from "@/modules/notifications/local-booking-email";
-import { localBookingEmails, whatsappAttempts, whatsappConsents, whatsappNotifications } from "@/db/schema/notifications";
+import { localBookingEmails, whatsappAttempts, whatsappConsents, whatsappNotifications, whatsappPatientLinks } from "@/db/schema/notifications";
 import { createPostBookingWhatsApp } from "@/modules/notifications/post-booking";
 import type { SendResult } from "@/modules/notifications/meta";
 import { createWhatsAppDelivery } from "@/modules/notifications/delivery";
@@ -68,8 +68,15 @@ function whatsappConversation(phone: string, conversationClock = clock) {
 async function chooseWhatsAppSlot(message: (body: string, id?: string) => ReturnType<ReturnType<typeof createWhatsAppConversationService>["process"]>, email: string, name = "Synthetic WhatsApp Patient") {
   await message("Hi"); await message("book"); await message(name); await message(email);
   const dates = await message("0000");
+  return chooseWhatsAppDate(message, dates);
+}
+async function chooseWhatsAppDate(
+  message: ReturnType<typeof whatsappConversation>["message"],
+  dates: Awaited<ReturnType<ReturnType<typeof whatsappConversation>["message"]>>,
+  dateIndex = 0,
+) {
   if (dates?.reply.type !== "list") throw new Error("Expected available dates.");
-  const dateId = dates.reply.rows.find((row) => row.id.startsWith("D:"))?.id;
+  const dateId = dates.reply.rows.filter((row) => /^D:\d/.test(row.id))[dateIndex]?.id;
   if (!dateId) throw new Error("No available date option.");
   const times = await message(dateId);
   if (times?.reply.type !== "list") throw new Error("Expected available time slots.");
@@ -130,6 +137,7 @@ beforeAll(async () => {
 beforeEach(async () => {
   now = new Date("2026-11-09T08:00:00Z");
   await database.db.delete(bookingRequests); await database.db.delete(bookingAudit); await database.db.delete(appointments); await database.db.delete(clinicSettings);
+  await database.db.delete(whatsappPatientLinks);
   await database.db.delete(patientSession); await database.db.insert(patientSession).values(originalPatientSessions);
   await database.db.delete(staffSession); await database.db.insert(staffSession).values(originalStaffSessions);
   await database.db.update(staffAccess).set({ active: true });
@@ -217,8 +225,64 @@ describe("WhatsApp conversational booking", () => {
 
     const email = `bad-code-${randomUUID()}@example.test`, authFlow = whatsappConversation("+919899999994");
     await authFlow.message("Hi"); await authFlow.message("book"); await authFlow.message("Synthetic Patient"); await authFlow.message(email);
-    expect((await authFlow.message("1111"))?.state).toBe("WAITING_FOR_EMAIL");
+    expect(await authFlow.message("1111")).toMatchObject({ state: "WAITING_FOR_EMAIL", reply: { type: "text", body: expect.stringContaining("invalid or expired") } });
+    expect((await authFlow.message("D:2026-11-10"))?.state).toBe("WAITING_FOR_EMAIL");
     expect(await database.db.select().from(patientUser).where(eq(patientUser.email, email))).toHaveLength(0);
+  });
+
+  it("serializes two valid OTP messages and sends only one date picker", async () => {
+    const flow = whatsappConversation("+919899999981"), email = `duplicate-${randomUUID()}@example.test`;
+    await flow.message("book"); await flow.message("Synthetic Patient"); await flow.message(email);
+    flow.send.mockClear();
+    const replies = await Promise.all([flow.message("0000"), flow.message("0000")]);
+    expect(replies.filter(Boolean)).toMatchObject([{ state: "SELECTING_DATE", reply: { type: "list" } }]);
+    expect(flow.send).toHaveBeenCalledTimes(1);
+    const [patient] = await database.db.select().from(patientUser).where(eq(patientUser.email, email));
+    expect(await database.db.select().from(patientSession).where(eq(patientSession.userId, patient.id))).toHaveLength(1);
+    expect(await database.db.select().from(whatsappPatientLinks).where(eq(whatsappPatientLinks.patientUserId, patient.id))).toHaveLength(1);
+  });
+
+  it("verifies a website account on first use and books again from its linked number without a code", async () => {
+    const phone = "+919899999982", verified = whatsappConversation(phone);
+    await verified.message("book"); await verified.message("Synthetic Patient");
+    expect((await verified.message(adminEmail))?.state).toBe("WAITING_FOR_CODE");
+    await chooseWhatsAppDate(verified.message, await verified.message("0000"));
+    expect((await verified.message("confirm_no_updates"))?.state).toBe("BOOKING_COMPLETED");
+    const returning = whatsappConversation(phone);
+    expect((await returning.message("book_appointment"))?.state).toBe("WAITING_FOR_NAME");
+    await returning.message("Synthetic Patient");
+    const dates = await returning.message(adminEmail);
+    expect(dates?.state).toBe("SELECTING_DATE");
+    await chooseWhatsAppDate(returning.message, dates, 1);
+    expect((await returning.message("confirm_no_updates"))?.state).toBe("BOOKING_COMPLETED");
+    expect(await database.db.select().from(appointments)).toHaveLength(2);
+  });
+
+  it("requires a code and explicit replacement on a new number and rejects a stale linked checkout", async () => {
+    const first = whatsappConversation("+919899999983"), second = whatsappConversation("+919899999984");
+    const email = `replacement-${randomUUID()}@example.test`;
+    await first.message("book"); await first.message("Synthetic Patient"); await first.message(email);
+    expect((await first.message("0000"))?.state).toBe("SELECTING_DATE");
+    await first.message("cancel"); await first.message("book"); await first.message("Synthetic Patient");
+    await chooseWhatsAppDate(first.message, await first.message(email));
+    const [original] = await database.db.select().from(whatsappPatientLinks);
+
+    await second.message("book"); await second.message("Synthetic Patient");
+    expect((await second.message(email))?.state).toBe("WAITING_FOR_CODE");
+    expect((await second.message("0000"))?.state).toBe("CONFIRMING_NUMBER_REPLACEMENT");
+    expect(await database.db.select().from(whatsappPatientLinks)).toEqual([original]);
+    expect((await second.message("keep_number"))?.state).toBe("SELECTING_DATE");
+    expect(await database.db.select().from(whatsappPatientLinks)).toEqual([original]);
+    await second.message("cancel"); await second.message("book"); await second.message("Synthetic Patient");
+    expect((await second.message(email))?.state).toBe("WAITING_FOR_CODE");
+    await second.message("0000");
+    expect((await second.message("replace_number"))?.state).toBe("SELECTING_DATE");
+
+    expect((await first.message("confirm_no_updates"))?.state).toBe("WAITING_FOR_EMAIL");
+    expect(await database.db.select().from(appointments)).toHaveLength(0);
+    expect((await first.message(email))?.state).toBe("WAITING_FOR_CODE");
+    await second.message("cancel"); await second.message("book"); await second.message("Synthetic Patient");
+    expect((await second.message(email))?.state).toBe("SELECTING_DATE");
   });
 
   it("offers no dates when the schedule is closed and rechecks a slot taken mid-conversation", async () => {
@@ -271,9 +335,11 @@ describe("WhatsApp conversational booking", () => {
     expect(await flow.process(phone, confirmationId, "confirm_updates")).toBeNull();
     expect(send).toHaveBeenCalledTimes(replyCount + 1);
     expect(await database.db.select({ id: appointments.id }).from(appointments).where(eq(appointments.source, "patient"))).toHaveLength(1);
-    for (const command of ["book", "support", "menu", "restart", "cancel_booking"]) {
+    for (const command of ["restart", "cancel_booking"]) {
       expect(await inbound(command)).toMatchObject({ state: "BOOKING_COMPLETED", reply: { type: "text" } });
     }
+    expect(await inbound("menu")).toMatchObject({ state: "BOOKING_COMPLETED", reply: { type: "buttons" } });
+    expect((await inbound("contact_support"))?.reply.body).toContain("+911234567890");
     expect((await inbound("Cancel my appointment"))?.reply.body).toContain("My appointments");
     const doctor = createDoctorAppointmentsService(database.db, identity.access, () => protection, clock);
     await doctor.cancel(credentials.admin, doctorInput(appointment.id));

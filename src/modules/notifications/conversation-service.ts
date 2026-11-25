@@ -4,8 +4,9 @@ import { z } from "zod";
 import type { ApplicationDatabase } from "@/db/connection";
 import { patientSession, patientUser } from "@/db/schema/auth";
 import { appointments, bookingRequests } from "@/db/schema/booking";
-import { whatsappConversations, whatsappWebhookMessages } from "@/db/schema/notifications";
+import { whatsappConversations, whatsappPatientLinks, whatsappWebhookMessages } from "@/db/schema/notifications";
 import { readClinicConfiguration } from "@/modules/clinic/repository";
+import { BookingError, type WhatsAppBookingPrincipal } from "@/modules/booking/models";
 import type { createBookingService } from "@/modules/booking/service";
 import type { createSlotAvailabilityService } from "@/modules/scheduling/slots";
 import { createWhatsAppConversationVault } from "./conversation-vault";
@@ -13,8 +14,8 @@ import type { ConversationMessage, ConversationSender } from "./meta-conversatio
 
 const emailSchema = z.string().trim().toLowerCase().max(254).pipe(z.email());
 const nameSchema = z.string().trim().min(1).max(100).refine((value) => !/[\u0000-\u001f\u007f]/u.test(value));
-type State = "MAIN_MENU" | "WAITING_FOR_NAME" | "WAITING_FOR_EMAIL" | "WAITING_FOR_CODE" | "SELECTING_DATE" | "SELECTING_SLOT" | "CONFIRMING_BOOKING" | "BOOKING_COMPLETED" | "SUPPORT_REQUESTED";
-type Data = { phone: string; name?: string; email?: string; patientUserId?: string; patientSessionId?: string; date?: string; dateNextCursor?: string; startsAt?: string; requestId?: string; slotPage?: number; lastInboundId?: string; lastReply?: ConversationMessage; };
+type State = "MAIN_MENU" | "WAITING_FOR_NAME" | "WAITING_FOR_EMAIL" | "WAITING_FOR_CODE" | "CONFIRMING_NUMBER_REPLACEMENT" | "SELECTING_DATE" | "SELECTING_SLOT" | "CONFIRMING_BOOKING" | "BOOKING_COMPLETED" | "SUPPORT_REQUESTED";
+type Data = { phone: string; name?: string; email?: string; patientUserId?: string; patientSessionId?: string; linkHash?: string; previousLinkHash?: string; date?: string; dateNextCursor?: string; startsAt?: string; requestId?: string; slotPage?: number; lastInboundId?: string; lastReply?: ConversationMessage; };
 type PatientAuthApi = {
   api: {
     sendVerificationOTP(input: { body: { email: string; type: "sign-in" } }): Promise<unknown>;
@@ -24,6 +25,7 @@ type PatientAuthApi = {
 type BookingService = Pick<ReturnType<typeof createBookingService>, "bookForWhatsApp">;
 type Slots = Pick<ReturnType<typeof createSlotAvailabilityService>, "read">;
 const DAY_MS = 86_400_000;
+type Transaction = Parameters<Parameters<ApplicationDatabase["transaction"]>[0]>[0];
 const SESSION_MS = 30 * 60_000;
 
 function menu(): ConversationMessage {
@@ -48,6 +50,7 @@ export function createWhatsAppConversationService(
   encodedKey: string | undefined,
   clock = () => new Date(),
   uuid = () => crypto.randomUUID(),
+  stateDb = db,
 ) {
   const vault = createWhatsAppConversationVault(encodedKey);
 
@@ -59,6 +62,14 @@ export function createWhatsAppConversationService(
 
   function withClinicContact(body: string, contact: string) {
     return text(contact ? `${body}\n\n${contact}` : body);
+  }
+
+  async function supportReply(): Promise<ConversationMessage> {
+    const clinic = await readClinicConfiguration(db);
+    const methods = [clinic?.phone ? `Phone: ${clinic.phone}` : "", clinic?.email ? `Email: ${clinic.email}` : ""].filter(Boolean).join("\n");
+    return { type: "buttons", body: methods ? `Please contact the clinic team:\n${methods}` : "The clinic has not configured its phone or email contact yet. Please try again later.", buttons: [
+      { id: "book", title: "Book appointment" }, { id: "menu", title: "Main menu" },
+    ] };
   }
 
   async function completedAppointment(data: Data) {
@@ -102,38 +113,62 @@ export function createWhatsAppConversationService(
     return { type: "list", body: `Choose a time on ${shortDate(date)} (${timezone}), or send Cancel to return to the main menu.`, button: "View times", section: "Available times", rows };
   }
 
-  async function process(phone: string, messageId: string, incoming: string): Promise<{ state: State; data: Data; reply: ConversationMessage } | null> {
-    const senderHash = vault.senderHash(phone), now = clock();
-    const existing = await db.transaction(async (tx) => {
-      await tx.insert(whatsappConversations).values({ senderHash, state: "MAIN_MENU", payloadCiphertext: vault.encrypt(senderHash, { phone } satisfies Data), expiresAt: new Date(now.getTime() + SESSION_MS), updatedAt: now }).onConflictDoNothing();
-      const accepted = await tx.insert(whatsappWebhookMessages).values({ messageId, receivedAt: now }).onConflictDoNothing().returning({ messageId: whatsappWebhookMessages.messageId });
-      const [row] = await tx.select().from(whatsappConversations).where(eq(whatsappConversations.senderHash, senderHash)).for("update");
-      const data = row ? vault.decrypt<Data>(senderHash, row.payloadCiphertext) : { phone };
-      if (!accepted.length) return { duplicate: true as const, state: (row?.state ?? "MAIN_MENU") as State, data };
-      if (row && row.expiresAt <= now && row.state !== "BOOKING_COMPLETED") return { duplicate: false as const, state: "MAIN_MENU" as State, data: { phone } };
-      return { duplicate: false as const, state: (row?.state ?? "MAIN_MENU") as State, data };
-    });
+  async function openDates(data: Data): Promise<ConversationMessage> {
+    const choices = await dateChoices().catch(() => null);
+    data.dateNextCursor = choices?.nextCursor;
+    if (!choices) return text("Your email is verified. Dates are temporarily unavailable. Send View dates to try again.");
+    return choices.days.length ? datesMessage(choices.days, choices.nextCursor) : text("There are no available appointment times right now. Send Cancel to return to the main menu.");
+  }
 
-    if (existing.duplicate) {
-      if (existing.data.lastInboundId === messageId && existing.data.lastReply) {
-        const cached = existing.data.lastReply;
-        try {
-          await sender.send(phone, existing.state === "BOOKING_COMPLETED" && cached.type === "buttons"
-            ? withClinicContact(cached.body, await clinicContact()) : cached);
-        }
-        catch { throw new Error("WHATSAPP_REPLY_FAILED"); }
-      }
+  function verifiedPrincipal(data: Data): WhatsAppBookingPrincipal | null {
+    if (!data.patientUserId || !data.email) return null;
+    if (data.linkHash) return { userId: data.patientUserId, linkHash: data.linkHash, email: data.email };
+    return data.patientSessionId ? { userId: data.patientUserId, sessionId: data.patientSessionId } : null;
+  }
+
+  async function verifyCode(email: string, otp: string, name: string | undefined, now: Date) {
+    let result: Awaited<ReturnType<PatientAuthApi["api"]["signInEmailOTP"]>>;
+    try {
+      result = await patientAuth.api.signInEmailOTP({ body: { email, otp, name } });
+    } catch {
       return null;
     }
-    let { state, data } = existing;
+    const [session] = await db.select({ id: patientSession.id, userId: patientSession.userId }).from(patientSession)
+      .innerJoin(patientUser, eq(patientUser.id, patientSession.userId))
+      .where(and(eq(patientSession.token, result.token), eq(patientSession.userId, result.user.id),
+        eq(patientUser.email, email), eq(patientUser.emailVerified, true), gt(patientSession.expiresAt, now))).limit(1);
+    return session;
+  }
+
+  async function transition(tx: Transaction, senderHash: string, phone: string, messageId: string, incoming: string, now: Date) {
+    await tx.insert(whatsappConversations).values({ senderHash, state: "MAIN_MENU", payloadCiphertext: vault.encrypt(senderHash, { phone }), expiresAt: new Date(now.getTime() + SESSION_MS), updatedAt: now }).onConflictDoNothing();
+    const [row] = await tx.select().from(whatsappConversations).where(eq(whatsappConversations.senderHash, senderHash)).for("update");
+    const accepted = await tx.insert(whatsappWebhookMessages).values({ messageId, receivedAt: now }).onConflictDoNothing().returning({ messageId: whatsappWebhookMessages.messageId });
+    let state = row.state as State;
+    let data = vault.decrypt<Data>(senderHash, row.payloadCiphertext);
+    if (!accepted.length) {
+      if (data.lastInboundId !== messageId || !data.lastReply) return null;
+      return { state, data, reply: data.lastReply, duplicate: true };
+    }
+    if (row.expiresAt <= now && state !== "BOOKING_COMPLETED") {
+      state = "MAIN_MENU";
+      data = { phone };
+    }
+
     const normalized = incoming.trim(), command = normalized.toLowerCase();
     let reply: ConversationMessage;
     if (state === "BOOKING_COMPLETED") {
       const appointment = await completedAppointment(data);
       if (appointment?.status === "cancelled") {
         state = "MAIN_MENU"; data = { phone }; reply = menu();
+      } else if (command === "book" || normalized === "book_appointment") {
+        state = "WAITING_FOR_NAME"; data = { phone }; reply = text("What name should we use for your appointment? Send Cancel to return to the main menu.");
       } else if (["cancel", "cancel appointment", "cancel my appointment", "cancel_booking"].includes(command)) {
         reply = withClinicContact("You can cancel your appointment in My appointments on the booking website or contact the clinic.", await clinicContact());
+      } else if (normalized === "support" || normalized === "contact_support") {
+        reply = await supportReply();
+      } else if (["hi", "hello", "hey", "menu", "start"].includes(command)) {
+        reply = menu();
       } else {
         reply = withClinicContact(appointment?.status === "confirmed"
           ? confirmationBody({ ...appointment, startsAt: appointment.startsAt.toISOString() })
@@ -145,9 +180,8 @@ export function createWhatsAppConversationService(
       if (command === "hi" || command === "hello" || command === "hey" || command === "menu" || command === "start") reply = menu();
       else if (normalized === "book" || normalized === "book_appointment") { state = "WAITING_FOR_NAME"; reply = text("What name should we use for your appointment? Send Cancel to return to the main menu."); }
       else if (normalized === "support" || normalized === "contact_support") {
-        const clinic = await readClinicConfiguration(db);
-        const methods = [clinic?.phone ? `Phone: ${clinic.phone}` : "", clinic?.email ? `Email: ${clinic.email}` : ""].filter(Boolean).join("\n");
-        state = "SUPPORT_REQUESTED"; reply = { type: "buttons", body: methods ? `Please contact the clinic team:\n${methods}` : "The clinic has not configured its phone or email contact yet. Please try again later.", buttons: [{ id: "book", title: "Book appointment" }, { id: "menu", title: "Main menu" }] };
+        state = "SUPPORT_REQUESTED";
+        reply = await supportReply();
       } else reply = menu();
     } else if (state === "SUPPORT_REQUESTED") {
       if (normalized === "book" || normalized === "book_appointment") { state = "WAITING_FOR_NAME"; data = { phone }; reply = text("What name should we use for your appointment? Send Cancel to return to the main menu."); }
@@ -155,31 +189,88 @@ export function createWhatsAppConversationService(
     } else if (state === "WAITING_FOR_NAME") {
       const name = nameSchema.safeParse(normalized);
       if (!name.success) reply = text("Please enter your name (up to 100 characters).");
-      else { data.name = name.data; state = "WAITING_FOR_EMAIL"; reply = text("What is your email address? We’ll send a one-time verification code before showing available times. Send Cancel to stop."); }
+      else { data.name = name.data; state = "WAITING_FOR_EMAIL"; reply = text("What is your email address? If we need to verify it, we’ll ask for a one-time code before showing available times. Send Cancel to stop."); }
     } else if (state === "WAITING_FOR_EMAIL") {
       const email = emailSchema.safeParse(normalized);
       if (!email.success) reply = text("Please enter a valid email address.");
       else {
-        try {
-          await patientAuth.api.sendVerificationOTP({ body: { email: email.data, type: "sign-in" } });
-          data.email = email.data; state = "WAITING_FOR_CODE"; reply = text("A verification code was sent to that email. Enter it here; it expires in five minutes. Send Cancel to stop.");
-        } catch { reply = text("Email verification is temporarily unavailable. Please try again later or contact the clinic."); }
+        const linkHash = vault.linkHash(phone, email.data);
+        const [linked] = await tx.select({ userId: patientUser.id }).from(patientUser)
+          .innerJoin(whatsappPatientLinks, eq(whatsappPatientLinks.patientUserId, patientUser.id))
+          .where(and(eq(patientUser.email, email.data), eq(patientUser.emailVerified, true),
+            eq(whatsappPatientLinks.linkHash, linkHash)));
+        if (linked) {
+          data = { phone, name: data.name, email: email.data, patientUserId: linked.userId, linkHash };
+          state = "SELECTING_DATE";
+          reply = await openDates(data);
+        } else {
+          try {
+            await patientAuth.api.sendVerificationOTP({ body: { email: email.data, type: "sign-in" } });
+            data = { phone, name: data.name, email: email.data };
+            state = "WAITING_FOR_CODE";
+            reply = text("Enter the one-time verification code for that email within five minutes. Send Cancel to stop.");
+          } catch { reply = text("Email verification is temporarily unavailable. Please try again later or contact the clinic."); }
+        }
       }
     } else if (state === "WAITING_FOR_CODE") {
-      if (!data.email || !/^\d{4,6}$/.test(normalized)) reply = text("Enter the verification code from your email, or send Cancel to start over.");
+      if (!data.email || !/^\d{4,6}$/.test(normalized)) reply = text("Enter the verification code for your email, or send Cancel to start over.");
       else {
-        try {
-          const result = await patientAuth.api.signInEmailOTP({ body: { email: data.email, otp: normalized, name: data.name } });
-          const [session] = await db.select({ id: patientSession.id, userId: patientSession.userId }).from(patientSession).innerJoin(patientUser, eq(patientUser.id, patientSession.userId))
-            .where(and(eq(patientSession.token, result.token), eq(patientSession.userId, result.user.id), eq(patientUser.emailVerified, true), gt(patientSession.expiresAt, now))).limit(1);
-          if (!session) throw new Error("Verified session could not be confirmed.");
-          data.patientUserId = session.userId; data.patientSessionId = session.id; state = "SELECTING_DATE";
-          const choices = await dateChoices();
-          data.dateNextCursor = choices.nextCursor;
-          reply = choices.days.length ? datesMessage(choices.days, choices.nextCursor) : text("There are no available appointment times right now. Send Cancel to return to the main menu.");
-        } catch { reply = text("That code is invalid or expired. Request a new one by sending your email again, or send Cancel to start over."); state = "WAITING_FOR_EMAIL"; }
+        const session = await verifyCode(data.email, normalized, data.name, now);
+        if (!session) {
+          state = "WAITING_FOR_EMAIL";
+          reply = text("That code is invalid or expired. Request a new one by sending your email again, or send Cancel to start over.");
+        } else {
+          data.patientUserId = session.userId;
+          data.patientSessionId = session.id;
+          const linkHash = vault.linkHash(phone, data.email);
+          await tx.insert(whatsappPatientLinks).values({ patientUserId: session.userId, linkHash, verifiedAt: now }).onConflictDoNothing();
+          const [link] = await tx.select().from(whatsappPatientLinks).where(eq(whatsappPatientLinks.patientUserId, session.userId));
+          if (link?.linkHash === linkHash) {
+            state = "SELECTING_DATE";
+            reply = await openDates(data);
+          } else {
+            data.previousLinkHash = link?.linkHash;
+            state = "CONFIRMING_NUMBER_REPLACEMENT";
+            reply = { type: "buttons", body: "Your email is verified. Replace the WhatsApp number linked to this account, or keep it and book just this visit from this number?", buttons: [
+              { id: "replace_number", title: "Replace number" }, { id: "keep_number", title: "Keep linked number" },
+            ] };
+          }
+        }
       }
+    } else if (state === "CONFIRMING_NUMBER_REPLACEMENT") {
+      if ((normalized === "replace_number" || normalized === "keep_number") && data.patientUserId && data.email && data.patientSessionId) {
+        if (normalized === "replace_number") {
+          const [session] = await tx.select({ id: patientSession.id }).from(patientSession)
+            .innerJoin(patientUser, eq(patientUser.id, patientSession.userId))
+            .where(and(eq(patientSession.id, data.patientSessionId), eq(patientSession.userId, data.patientUserId),
+              eq(patientUser.email, data.email), eq(patientUser.emailVerified, true), gt(patientSession.expiresAt, now)));
+          if (!session || !data.previousLinkHash) {
+            data = { phone, name: data.name };
+            state = "WAITING_FOR_EMAIL";
+            reply = text("Your verification is no longer current. Enter your email to verify again.");
+          } else {
+            const [updated] = await tx.update(whatsappPatientLinks).set({ linkHash: vault.linkHash(phone, data.email), verifiedAt: now })
+              .where(and(eq(whatsappPatientLinks.patientUserId, data.patientUserId), eq(whatsappPatientLinks.linkHash, data.previousLinkHash)))
+              .returning({ userId: whatsappPatientLinks.patientUserId });
+            if (!updated) {
+              data = { phone, name: data.name };
+              state = "WAITING_FOR_EMAIL";
+              reply = text("The linked number changed. Enter your email to verify again.");
+            } else {
+              state = "SELECTING_DATE";
+              reply = await openDates(data);
+            }
+          }
+        } else {
+          state = "SELECTING_DATE";
+          reply = await openDates(data);
+        }
+        delete data.previousLinkHash;
+      } else if (/^\d{4,6}$/.test(normalized)) return null;
+      else reply = text("Choose Replace number, Keep linked number, or Cancel.");
     } else if (state === "SELECTING_DATE") {
+      // A second code can arrive after the first advanced this chat. Keep its date reply cached.
+      if (/^\d{4,6}$/.test(normalized)) return null;
       if (normalized.startsWith("D:MORE:")) {
         const cursor = normalized.slice("D:MORE:".length), choices = await dateChoices(cursor);
         data.dateNextCursor = choices.nextCursor;
@@ -205,7 +296,7 @@ export function createWhatsAppConversationService(
       const startsAt = normalized.startsWith("S:") ? normalized.slice(2) : "";
       const view = data.date ? await slots.read(data.date).catch(() => null) : null;
       const slot = view?.slots.find((choice) => choice.startsAt === startsAt && choice.availability === "available");
-      if (!slot || !view || !data.name || !data.email || !data.patientSessionId || !data.patientUserId) {
+      if (!slot || !view || !data.name || !verifiedPrincipal(data)) {
         state = "SELECTING_DATE"; const choices = await dateChoices(); data.dateNextCursor = choices.nextCursor; reply = choices.days.length ? datesMessage(choices.days, choices.nextCursor) : text("No appointment times are currently available.");
       } else {
         data.startsAt = slot.startsAt; data.requestId = uuid(); state = "CONFIRMING_BOOKING";
@@ -216,18 +307,26 @@ export function createWhatsAppConversationService(
       }
     } else if (state === "CONFIRMING_BOOKING") {
       if (normalized === "confirm_updates" || normalized === "confirm_no_updates") {
-        if (!data.patientUserId || !data.patientSessionId || !data.requestId || !data.startsAt || !data.name) { state = "MAIN_MENU"; data = { phone }; reply = menu(); }
+        const principal = verifiedPrincipal(data);
+        if (!principal || !data.requestId || !data.startsAt || !data.name) { state = "MAIN_MENU"; data = { phone }; reply = menu(); }
         else {
           const contact = await clinicContact();
           try {
-            const receipt = await booking.bookForWhatsApp({ userId: data.patientUserId, sessionId: data.patientSessionId }, {
+            const receipt = await booking.bookForWhatsApp(principal, {
               requestId: data.requestId, startsAt: data.startsAt, name: data.name, phone, whatsappConsent: normalized === "confirm_updates",
             });
             state = "BOOKING_COMPLETED";
             reply = withClinicContact(confirmationBody(receipt), contact);
-          } catch {
-            state = "SELECTING_DATE"; const choices = await dateChoices();
-            reply = choices.days.length ? text("That time is no longer available. Please choose another date.") : text("We could not confirm that time and no other times are available. Please contact the clinic.");
+          } catch (error) {
+            if (error instanceof BookingError && error.code === "SIGN_IN_REQUIRED") {
+              data = { phone, name: data.name };
+              state = "WAITING_FOR_EMAIL";
+              reply = text("Your verification is no longer current. Enter your email to verify again.");
+            } else {
+              state = "SELECTING_DATE";
+              const choices = await dateChoices();
+              reply = choices.days.length ? text("That time is no longer available. Please choose another date.") : text("We could not confirm that time and no other times are available. Please contact the clinic.");
+            }
           }
         }
       } else reply = text("Choose Confirm + updates, Confirm only, or Cancel.");
@@ -235,15 +334,25 @@ export function createWhatsAppConversationService(
 
     data.lastInboundId = messageId; data.lastReply = reply;
     const updatedAt = clock();
-    await db.insert(whatsappConversations).values({ senderHash, state, payloadCiphertext: vault.encrypt(senderHash, data), expiresAt: new Date(updatedAt.getTime() + SESSION_MS), updatedAt })
-      .onConflictDoUpdate({ target: whatsappConversations.senderHash, set: { state, payloadCiphertext: vault.encrypt(senderHash, data), expiresAt: new Date(updatedAt.getTime() + SESSION_MS), updatedAt } });
+    await tx.update(whatsappConversations).set({
+      state, payloadCiphertext: vault.encrypt(senderHash, data), expiresAt: new Date(updatedAt.getTime() + SESSION_MS), updatedAt,
+    }).where(eq(whatsappConversations.senderHash, senderHash));
+    return { state, data, reply, duplicate: false };
+  }
+
+  async function process(phone: string, messageId: string, incoming: string): Promise<{ state: State; data: Data; reply: ConversationMessage } | null> {
+    const senderHash = vault.senderHash(phone);
+    // Hold the same sender row until its next state and deduplication receipt commit together.
+    const result = await stateDb.transaction((tx) => transition(tx, senderHash, phone, messageId, incoming, clock()));
+    if (!result) return null;
+    const { state, data, reply, duplicate } = result;
     try { await sender.send(phone, reply); }
     catch (error) {
       const code = error instanceof Error && /^META_[A-Z_]+$/.test(error.message) ? error.message : "META_SEND_FAILED";
       console.warn(`WhatsApp conversation reply could not be sent; sender=${senderHash.slice(0, 12)} code=${code}`);
       throw new Error("WHATSAPP_REPLY_FAILED");
     }
-    return { state, data, reply };
+    return duplicate ? null : { state, data, reply };
   }
 
   return { process };

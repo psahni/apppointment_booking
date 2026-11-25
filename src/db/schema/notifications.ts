@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import { boolean, check, integer, pgTable, text, timestamp, unique, uuid } from "drizzle-orm/pg-core";
+import { patientUser } from "./auth";
 import { appointments } from "./booking";
 
 export const whatsappConsents = pgTable("whatsapp_consents", {
@@ -54,9 +55,16 @@ export const whatsappConversations = pgTable("whatsapp_conversations", {
   payloadCiphertext: text("payload_ciphertext").notNull(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [check("whatsapp_conversation_state", sql`${t.state} in ('MAIN_MENU', 'WAITING_FOR_NAME', 'WAITING_FOR_EMAIL', 'WAITING_FOR_CODE', 'SELECTING_DATE', 'SELECTING_SLOT', 'CONFIRMING_BOOKING', 'BOOKING_COMPLETED', 'SUPPORT_REQUESTED')`)]);
+}, (t) => [check("whatsapp_conversation_state", sql`${t.state} in ('MAIN_MENU', 'WAITING_FOR_NAME', 'WAITING_FOR_EMAIL', 'WAITING_FOR_CODE', 'CONFIRMING_NUMBER_REPLACEMENT', 'SELECTING_DATE', 'SELECTING_SLOT', 'CONFIRMING_BOOKING', 'BOOKING_COMPLETED', 'SUPPORT_REQUESTED')`)]);
 
 export const whatsappWebhookMessages = pgTable("whatsapp_webhook_messages", {
   messageId: text("message_id").primaryKey(),
   receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// The digest binds the signed sender number to the email verified for this account.
+export const whatsappPatientLinks = pgTable("whatsapp_patient_links", {
+  patientUserId: text("patient_user_id").primaryKey().references(() => patientUser.id, { onDelete: "cascade" }),
+  linkHash: text("link_hash").notNull(),
+  verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull(),
 });
