@@ -21,7 +21,12 @@ export const patientCancellationSchema = z.object({ appointmentId: z.uuid() }).s
 export type CancellationReceipt = { id: string; status: "cancelled" };
 export const clinicBookingSchema = z.object({ ...bookingFields, email }).strict();
 export type PatientContact = z.infer<typeof contactSchema>;
-export type BookingActor = { kind: "patient" | "staff"; userId: string; sessionId: string; channel?: "web" | "whatsapp" };
+export type WhatsAppBookingPrincipal = { userId: string } & (
+  { sessionId: string } | { linkHash: string; email: string }
+);
+export type BookingActor =
+  | { kind: "patient" | "staff"; userId: string; sessionId: string; channel?: "web" | "whatsapp" }
+  | { kind: "patient"; channel: "whatsapp"; userId: string; linkHash: string; email: string };
 export type BookingReceipt = {
   id: string; status: "confirmed"; startsAt: string; endsAt: string; timezone: string;
   durationMinutes: number; bufferBeforeMinutes: number; bufferAfterMinutes: number;
