@@ -10,6 +10,9 @@ export function createWhatsAppConversationVault(encodedKey: string | undefined) 
   const indexKey = Buffer.from(hkdfSync("sha256", root, "nuvortiq-booking-v1", "whatsapp-sender-index", 32));
   return {
     senderHash(phone: string) { return createHmac("sha256", indexKey).update(phone).digest("hex"); },
+    linkHash(phone: string, email: string) {
+      return createHmac("sha256", indexKey).update(`patient-link:${phone}:${email}`).digest("hex");
+    },
     encrypt(senderHash: string, value: unknown) {
       const iv = randomBytes(12), cipher = createCipheriv("aes-256-gcm", encryptionKey, iv);
       cipher.setAAD(Buffer.from(`whatsapp-conversation:${senderHash}:v1`));
