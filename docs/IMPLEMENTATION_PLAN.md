@@ -1,6 +1,6 @@
 # Nuvortiq Smart Booking — Implementation Options
 
-**Status: patient-booking-first priority selected. ✅ Clinic settings [#6](https://github.com/psahni/portfolio_development/issues/6) and availability [#7](https://github.com/psahni/portfolio_development/issues/7) merged. Doctor calendar #20, shared booking #24 and patient sign-in/listing #10 are merged. Hosted patient booking #11 is merged into `main`; appointment management follows. Staff management #4 is merged into `main`; receptionist booking and agenda #8 are implemented on this review branch. Use GitHub issues as task specs.**
+**Status: patient-booking-first priority selected. ✅ Clinic settings [#6](https://github.com/psahni/apppointment_booking/issues/6) and availability [#7](https://github.com/psahni/apppointment_booking/issues/7) merged. Doctor calendar #20, shared booking #24 and patient sign-in/listing #10 are merged. Hosted patient booking #11 is merged into `main`; appointment management follows. Staff management #4 is merged into `main`; receptionist booking and agenda #8 are implemented on this review branch. Use GitHub issues as task specs.**
 
 **Progress:** ✅ M1 foundation, M2.1 access checks and M2.2 shared clinic login are implemented. The [auth revision](specs/AUTH_CODE_REVISION.md) records the flow and checks. Staff management #4 and receptionist booking/agenda #8 are on `main`. WhatsApp conversational booking #49 is implemented on this review branch with local-only generated email-code previews; real email transport and live Meta setup remain external, unverified work.
 
