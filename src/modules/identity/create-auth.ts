@@ -6,12 +6,13 @@ import { emailOTP } from "better-auth/plugins/email-otp";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { and, eq } from "drizzle-orm";
 import type { ApplicationDatabase } from "@/db/connection";
-import { patientAuthTables, staffAuthTables, staffAccess, staffUser } from "@/db/schema/auth";
+import { mapleDemoVerification, patientAuthTables, staffAuthTables, staffAccess, staffUser } from "@/db/schema/auth";
 import type { AuthMailer } from "@/platform/mail";
 import { adminPinPlugin } from "./admin-pin-plugin";
 import { resolveTestAuthMode, TEST_LOGIN_CODE } from "./test-mode";
 import { createAccessChecks } from "./access";
 import { createPatientAccessChecks } from "./patient-access";
+import { isMapleDemoPatient, mapleDemoCode } from "./maple-demo";
 
 type AuthConfiguration = {
   db: ApplicationDatabase;
@@ -20,10 +21,11 @@ type AuthConfiguration = {
   staffSecret: string;
   mailer: AuthMailer;
   testMode?: boolean;
+  patientDemoMode?: "web" | "whatsapp";
 };
 
 /** Keep patient and clinic identities, credentials and session checks separate. */
-export function createIdentity({ db, baseURL, patientSecret, staffSecret, mailer, testMode = false }: AuthConfiguration) {
+export function createIdentity({ db, baseURL, patientSecret, staffSecret, mailer, testMode = false, patientDemoMode }: AuthConfiguration) {
   if (patientSecret === staffSecret || Math.min(patientSecret.length, staffSecret.length) < 32) {
     throw new Error("Distinct patient and staff authentication secrets of at least 32 characters are required.");
   }
@@ -50,25 +52,29 @@ export function createIdentity({ db, baseURL, patientSecret, staffSecret, mailer
     appName: "Nuvortiq Patient",
     secret: patientSecret,
     basePath: "/api/auth/patient",
-    database: drizzleAdapter(db, { provider: "pg", schema: patientAuthTables }),
+    database: drizzleAdapter(db, { provider: "pg", schema: patientDemoMode === "web"
+      ? { ...patientAuthTables, verification: mapleDemoVerification }
+      : patientAuthTables }),
     advanced: { cookiePrefix: "nuvortiq-patient", useSecureCookies: baseURL.startsWith("https:") },
     emailAndPassword: { enabled: false },
     hooks: { before: createAuthMiddleware(async (ctx) => {
-      if (ctx.path !== "/email-otp/send-verification-otp" || ctx.body?.type !== "sign-in") return;
-      const address = typeof ctx.body.email === "string" ? ctx.body.email.trim().toLowerCase() : "";
-      if (!address) return;
+      const requesting = ctx.path === "/email-otp/send-verification-otp" && ctx.body?.type === "sign-in";
+      if (!requesting && ctx.path !== "/sign-in/email-otp") return;
+      const address = typeof ctx.body?.email === "string" ? ctx.body.email.trim().toLowerCase() : "";
+      if (patientDemoMode && !isMapleDemoPatient(address)) throw new APIError("FORBIDDEN", { message: "This account cannot sign in here." });
+      if (!requesting || !address) return;
       // Replace the previous code so a resend cannot leave stale attempt counters
       // in front of the new code. The auth router applies request limits first.
       await ctx.context.internalAdapter.deleteVerificationByIdentifier(`sign-in-otp-${address}`);
     }) },
     plugins: [emailOTP({
       ...codeOptions,
-      // New and returning patients share sign-in. The plugin creates a new patient
-      // only after consuming a valid, freshly requested code (also in local test mode).
-      disableSignUp: false,
+      ...(patientDemoMode ? { generateOTP: () => mapleDemoCode } : {}),
+      // Demo sign-in is restricted to seeded patients. Other modes retain verified signup.
+      disableSignUp: !!patientDemoMode,
       async sendVerificationOTP({ email, otp, type }) {
         if (type !== "sign-in") throw new Error("Unsupported patient verification request.");
-        if (!testing) await mailer.sendPatientLoginCode({ email, code: otp });
+        if (!testing && !patientDemoMode) await mailer.sendPatientLoginCode({ email, code: otp });
       },
     })],
   });

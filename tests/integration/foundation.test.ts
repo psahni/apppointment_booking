@@ -5,13 +5,16 @@ import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { beforeAll, beforeEach, afterAll, describe, expect, inject, it } from "vitest";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { createDatabase } from "@/db/connection";
 import { patientUser, patientVerification, staffUser, staffAccess, staffSession } from "@/db/schema/auth";
 import { createIdentity } from "@/modules/identity/create-auth";
 import { bootstrapAdmin } from "@/modules/identity/admin-pin";
 import { createStaffAuthHandler } from "@/modules/identity/http";
+import { createPatientAuthHandler } from "@/modules/identity/patient-http";
+import { mapleDemoCode, mapleDemoEnabled, mapleDemoPatients, mapleDemoStaff, mapleWhatsAppDemoEnabled } from "@/modules/identity/maple-demo";
+import { seedMapleDemo } from "@/modules/identity/seed-maple-demo";
 import type { LoginCode } from "@/platform/mail";
 import { createLocalAuthMailer } from "@/platform/local-auth-mailer";
 
@@ -25,9 +28,9 @@ let database: ReturnType<typeof createDatabase>;
 let identity: ReturnType<typeof createIdentity>;
 let adminId: string;
 
-function makeIdentity(testMode = false) {
+function makeIdentity(testMode = false, patientDemoMode?: "web" | "whatsapp") {
   return createIdentity({
-    db: database.db, baseURL, testMode,
+    db: database.db, baseURL, testMode, patientDemoMode,
     patientSecret: "patient-integration-secret-" + "a".repeat(32), staffSecret,
     mailer: {
       async sendPatientLoginCode(message) { mailbox.push({ ...message, audience: "patient" }); },
@@ -94,6 +97,72 @@ beforeAll(async () => {
 });
 
 afterAll(async () => { await database?.pool.end(); });
+
+it("restricts fixed-code demo login to seeded preview patients", async () => {
+  const preview = { APP_URL: "https://apppointment-booking-git-vercel-preview-nuvortiq.vercel.app", VERCEL_ENV: "preview", PATIENT_DEMO_MODE: "true" };
+  expect(mapleDemoEnabled(preview)).toBe(true);
+  expect(mapleWhatsAppDemoEnabled(preview)).toBe(true);
+  expect(mapleWhatsAppDemoEnabled({ ...preview, VERCEL_ENV: "production" })).toBe(false);
+  expect(mapleDemoEnabled({ ...preview, VERCEL_ENV: "production" })).toBe(false);
+  expect(mapleDemoEnabled({ ...preview, APP_URL: baseURL })).toBe(false);
+  expect(mapleDemoEnabled({ ...preview, PATIENT_DEMO_MODE: undefined })).toBe(false);
+  const review = { ...preview, VERCEL_GIT_COMMIT_REF: "feat/maple-patient-demo",
+    VERCEL_BRANCH_URL: "maple-review.vercel.app", APP_URL: "https://maple-review.vercel.app" };
+  expect(mapleDemoEnabled(review)).toBe(true);
+  expect(mapleWhatsAppDemoEnabled(review)).toBe(false);
+  expect(mapleDemoEnabled({ ...review, VERCEL_GIT_COMMIT_REF: "another-branch" })).toBe(false);
+  expect(mapleDemoEnabled({ ...review, APP_URL: "https://different.vercel.app" })).toBe(false);
+
+  const [{ email }, unseeded] = mapleDemoPatients;
+  const demoUserId = randomUUID();
+  await database.db.insert(patientUser).values({ id: demoUserId, name: "Existing sample patient", email });
+  const demo = makeIdentity(false, "web");
+  const handle = createPatientAuthHandler(() => demo.patient, () => baseURL);
+  let client = 10;
+  const post = (action: string, body: object) => handle(new Request(`${baseURL}/api/auth/patient/${action}`, {
+    method: "POST", headers: { origin: baseURL, "content-type": "application/json", "x-forwarded-for": `192.0.2.${client++}` }, body: JSON.stringify(body),
+  }));
+  const requestCode = (address: string) => post("email-otp/send-verification-otp", { email: address, type: "sign-in" });
+  const signIn = (address: string, otp = mapleDemoCode) => post("sign-in/email-otp", { email: address, otp });
+
+  expect((await signIn(email)).ok).toBe(false);
+  expect((await requestCode("visitor@example.test")).status).toBe(403);
+  for (const staff of mapleDemoStaff) expect((await signIn(staff.email)).status).toBe(403);
+  expect((await requestCode(unseeded.email)).ok).toBe(true);
+  expect((await signIn(unseeded.email)).ok).toBe(false);
+
+  expect(await seedMapleDemo(database.db)).toEqual({ patientsCreated: 2, staffCreated: 2 });
+  const [sampleStaff] = await database.db.select().from(staffUser).where(eq(staffUser.email, mapleDemoStaff[0].email));
+  await database.db.update(staffAccess).set({ active: false }).where(eq(staffAccess.userId, sampleStaff.id));
+  expect(await seedMapleDemo(database.db)).toEqual({ patientsCreated: 0, staffCreated: 0 });
+  const [existing] = await database.db.select().from(patientUser).where(eq(patientUser.email, email));
+  expect(existing).toMatchObject({ id: demoUserId, name: "Existing sample patient" });
+  const seedStaffAccess = await database.db.select({ role: staffAccess.role, active: staffAccess.active }).from(staffAccess)
+    .innerJoin(staffUser, eq(staffUser.id, staffAccess.userId))
+    .where(inArray(staffUser.email, mapleDemoStaff.map((staff) => staff.email))).orderBy(staffUser.email);
+  expect(seedStaffAccess).toEqual([{ role: "staff", active: false }, { role: "staff", active: true }]);
+
+  const standard = makeIdentity(true);
+  // WhatsApp uses the standard patient API. Requests for the same email can coexist.
+  await standard.patient.api.sendVerificationOTP({ body: { email, type: "sign-in" } });
+  expect((await requestCode(email)).ok).toBe(true);
+  expect((await signIn(email, "111111")).ok).toBe(false);
+  await expect(standard.patient.api.signInEmailOTP({ body: { email, otp: mapleDemoCode } })).rejects.toThrow();
+  expect((await standard.patient.api.signInEmailOTP({ body: { email, otp: "0000" } })).user.id).toBe(demoUserId);
+  await standard.staff.api.sendVerificationOTP({ body: { email: mapleDemoStaff[1].email, type: "sign-in" } });
+  await expect(standard.staff.api.signInEmailOTP({ body: { email: mapleDemoStaff[1].email, otp: mapleDemoCode } })).rejects.toThrow();
+  const whatsAppDemo = makeIdentity(false, "whatsapp").patient;
+  await expect(whatsAppDemo.api.signInEmailOTP({ body: { email, otp: mapleDemoCode } })).rejects.toThrow();
+  await whatsAppDemo.api.sendVerificationOTP({ body: { email, type: "sign-in" } });
+  expect((await whatsAppDemo.api.signInEmailOTP({ body: { email, otp: mapleDemoCode } })).user.id).toBe(demoUserId);
+  const response = await signIn(email);
+  expect(response.status).toBe(200);
+  const headers = new Headers({ cookie: cookies(response) });
+  expect((await identity.patientAccess.requirePatientAccess(headers)).userId).toBe(demoUserId);
+  await expect(identity.access.requireClinicAccess(headers)).rejects.toMatchObject({ status: "UNAUTHORIZED" });
+  expect((await signIn(email)).ok).toBe(false);
+  expect(mailbox.filter((message) => [email, unseeded.email].includes(message.email))).toHaveLength(0);
+});
 
 describe("PostgreSQL and migrations", () => {
   it("replays migrations and upgrades M1 without losing existing users", async () => {
