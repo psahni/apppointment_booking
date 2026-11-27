@@ -31,10 +31,8 @@ const DAY_MS = 86_400_000;
 type Transaction = Parameters<Parameters<ApplicationDatabase["transaction"]>[0]>[0];
 const SESSION_MS = 30 * 60_000;
 const CANCELLATION_PAGE_SIZE = 9;
-const cancellationCommands = new Set([
-  "cancel_appointment", "cancel an appointment", "cancel appointment", "cancel my appointment", "cancel my last appointment",
-  "i want to cancel", "i want to cancel an appointment", "i want to cancel my appointment", "i want to cancel my last appointment",
-]);
+// Match a complete, affirmative request. A match opens the flow and never confirms a cancellation.
+const cancellationRequest = /^(?:(?:i (?:want|need|would like) to|i['’]d like to|(?:can|could|would) (?:i|you)) )?(?:please )?cancel(?: (?:(?:my|the|an?) )?(?:(?:last|next|upcoming) )?appointment)?(?: please)?$/;
 const greetings = new Set(["hi", "hello", "hey", "menu", "start"]);
 type CancellableAppointment = Awaited<ReturnType<typeof readWhatsAppCancellableAppointments>>[number];
 
@@ -173,6 +171,9 @@ export function createWhatsAppConversationService(
 
     const normalized = incoming.trim(), command = normalized.toLowerCase();
     const cancellationCommand = command.replace(/[.!?]+$/, "").trimEnd().replace(/\s+/g, " ");
+    const bareCancel = cancellationCommand === "cancel";
+    const wantsCancellation = command === "cancel_appointment" ||
+      ((!bareCancel || state === "BOOKING_COMPLETED") && cancellationRequest.test(cancellationCommand));
     const keepAppointment = command === "keep_appointment" || command.replace(/\*/g, "").replace(/\s+/g, " ") === "keep appointment";
     const showMenu = async () => {
       const principal = verifiedPrincipal(data);
@@ -229,11 +230,11 @@ export function createWhatsAppConversationService(
         state = "MAIN_MENU";
         reply = { ...await showMenu(), body: "Cancellation stopped. I didn’t cancel your appointment." };
       } else reply = text("There’s no cancellation in progress. Send Menu to see your options.");
-    } else if (cancellationCommands.has(cancellationCommand) || (state === "BOOKING_COMPLETED" && cancellationCommand === "cancel")) {
+    } else if (wantsCancellation) {
       reply = await openCancellation();
     } else if (state === "SELECTING_CANCELLATION" || state === "CONFIRMING_CANCELLATION") {
       const principal = verifiedPrincipal(data);
-      if (greetings.has(command) || ["cancel", "restart", "start over"].includes(command)) {
+      if (bareCancel || greetings.has(command) || ["restart", "start over"].includes(command)) {
         delete data.cancellation;
         state = "MAIN_MENU";
         reply = await showMenu();
@@ -291,7 +292,7 @@ export function createWhatsAppConversationService(
       state = "MAIN_MENU";
       data = { phone, email: data.email, patientUserId: data.patientUserId, linkHash: data.linkHash, patientSessionId: data.patientSessionId };
       reply = await showMenu();
-    } else if (["cancel", "restart", "start over"].includes(command) || normalized === "cancel_booking") {
+    } else if (bareCancel || ["restart", "start over"].includes(command) || normalized === "cancel_booking") {
       state = "MAIN_MENU"; data = { phone }; reply = menu();
     } else if (state === "MAIN_MENU") {
       if (normalized === "book" || normalized === "book_appointment") { state = "WAITING_FOR_NAME"; data = { phone }; reply = text("What name should we use for your appointment? Send Cancel to return to the main menu."); }

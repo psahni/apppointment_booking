@@ -211,7 +211,7 @@ describe("WhatsApp conversational booking", () => {
 
     const second = whatsappConversation("+919899999992");
     const slot = await chooseWhatsAppSlot(second.message, `wa-${randomUUID()}@example.test`);
-    expect((await second.message("cancel"))?.state).toBe("MAIN_MENU");
+    expect((await second.message("Cancel."))?.state).toBe("MAIN_MENU");
     expect(await database.db.select({ id: appointments.id }).from(appointments)).toHaveLength(0);
     expect(slot.startsAt).toContain("T");
   });
@@ -340,11 +340,16 @@ describe("WhatsApp conversational booking", () => {
     }
     expect(await inbound("menu")).toMatchObject({ state: "BOOKING_COMPLETED", reply: { type: "buttons" } });
     expect((await inbound("contact_support"))?.reply.body).toContain("+911234567890");
+    expect((await inbound("Please do not cancel my appointment"))?.state).toBe("BOOKING_COMPLETED");
     expect(await inbound("i want to cancel")).toMatchObject({
       state: "CONFIRMING_CANCELLATION", reply: { type: "buttons", body: expect.stringContaining("Cancel your appointment") },
     });
     expect((await database.db.select().from(appointments).where(eq(appointments.id, appointment.id)))[0].status).toBe("confirmed");
     await inbound("keep_appointment");
+    for (const request of ["Could you please cancel my next appointment?", "I’d like to cancel my appointment"]) {
+      expect((await inbound(request))?.state).toBe("CONFIRMING_CANCELLATION");
+      await inbound("keep_appointment");
+    }
     const doctor = createDoctorAppointmentsService(database.db, identity.access, () => protection, clock);
     await doctor.cancel(credentials.admin, doctorInput(appointment.id));
     expect(await inbound("Hi")).toMatchObject({ state: "MAIN_MENU", reply: { type: "buttons" } });
