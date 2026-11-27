@@ -12,6 +12,8 @@ import { patientUser, patientVerification, staffUser, staffAccess, staffSession 
 import { createIdentity } from "@/modules/identity/create-auth";
 import { bootstrapAdmin } from "@/modules/identity/admin-pin";
 import { createStaffAuthHandler } from "@/modules/identity/http";
+import { createPatientAuthHandler } from "@/modules/identity/patient-http";
+import { mapleDemoCode, mapleDemoEnabled, mapleDemoPatients } from "@/modules/identity/maple-demo";
 import type { LoginCode } from "@/platform/mail";
 import { createLocalAuthMailer } from "@/platform/local-auth-mailer";
 
@@ -25,9 +27,9 @@ let database: ReturnType<typeof createDatabase>;
 let identity: ReturnType<typeof createIdentity>;
 let adminId: string;
 
-function makeIdentity(testMode = false) {
+function makeIdentity(testMode = false, patientDemoMode = false) {
   return createIdentity({
-    db: database.db, baseURL, testMode,
+    db: database.db, baseURL, testMode, patientDemoMode,
     patientSecret: "patient-integration-secret-" + "a".repeat(32), staffSecret,
     mailer: {
       async sendPatientLoginCode(message) { mailbox.push({ ...message, audience: "patient" }); },
@@ -94,6 +96,47 @@ beforeAll(async () => {
 });
 
 afterAll(async () => { await database?.pool.end(); });
+
+it("restricts fixed-code demo login to seeded preview patients", async () => {
+  const preview = { APP_URL: "https://apppointment-booking-git-vercel-preview-nuvortiq.vercel.app", VERCEL_ENV: "preview", PATIENT_DEMO_MODE: "true" };
+  expect(mapleDemoEnabled(preview)).toBe(true);
+  expect(mapleDemoEnabled({ ...preview, VERCEL_ENV: "production" })).toBe(false);
+  expect(mapleDemoEnabled({ ...preview, APP_URL: baseURL })).toBe(false);
+  expect(mapleDemoEnabled({ ...preview, PATIENT_DEMO_MODE: undefined })).toBe(false);
+
+  const [{ email, name }, unseeded] = mapleDemoPatients;
+  const demoUserId = randomUUID();
+  await database.db.insert(patientUser).values({ id: demoUserId, name, email });
+  const demo = makeIdentity(false, true);
+  const handle = createPatientAuthHandler(() => demo.patient, () => baseURL);
+  let client = 10;
+  const post = (action: string, body: object) => handle(new Request(`${baseURL}/api/auth/patient/${action}`, {
+    method: "POST", headers: { origin: baseURL, "content-type": "application/json", "x-forwarded-for": `192.0.2.${client++}` }, body: JSON.stringify(body),
+  }));
+  const requestCode = (address: string) => post("email-otp/send-verification-otp", { email: address, type: "sign-in" });
+  const signIn = (address: string, otp = mapleDemoCode) => post("sign-in/email-otp", { email: address, otp });
+
+  expect((await signIn(email)).ok).toBe(false);
+  expect((await requestCode("visitor@example.test")).status).toBe(403);
+  expect((await signIn(staffEmail)).status).toBe(403);
+  expect((await requestCode(unseeded.email)).ok).toBe(true);
+  expect((await signIn(unseeded.email)).ok).toBe(false);
+  expect((await requestCode(email)).ok).toBe(true);
+  expect((await signIn(email, "111111")).ok).toBe(false);
+  const normal = createPatientAuthHandler(() => identity.patient, () => baseURL);
+  const disabledDemoAttempt = await normal(new Request(`${baseURL}/api/auth/patient/sign-in/email-otp`, {
+    method: "POST", headers: { origin: baseURL, "content-type": "application/json", "x-forwarded-for": `192.0.2.${client++}` },
+    body: JSON.stringify({ email, otp: mapleDemoCode }),
+  }));
+  expect(disabledDemoAttempt.status).toBe(403);
+  const response = await signIn(email);
+  expect(response.status).toBe(200);
+  const headers = new Headers({ cookie: cookies(response) });
+  expect((await demo.patientAccess.requirePatientAccess(headers)).userId).toBe(demoUserId);
+  await expect(demo.access.requireClinicAccess(headers)).rejects.toMatchObject({ status: "UNAUTHORIZED" });
+  expect((await signIn(email)).ok).toBe(false);
+  expect(mailbox.filter((message) => [email, unseeded.email].includes(message.email))).toHaveLength(0);
+});
 
 describe("PostgreSQL and migrations", () => {
   it("replays migrations and upgrades M1 without losing existing users", async () => {
