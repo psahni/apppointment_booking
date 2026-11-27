@@ -55,7 +55,7 @@ export const whatsappConversations = pgTable("whatsapp_conversations", {
   payloadCiphertext: text("payload_ciphertext").notNull(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [check("whatsapp_conversation_state", sql`${t.state} in ('MAIN_MENU', 'WAITING_FOR_NAME', 'WAITING_FOR_EMAIL', 'WAITING_FOR_CODE', 'CONFIRMING_NUMBER_REPLACEMENT', 'SELECTING_DATE', 'SELECTING_SLOT', 'CONFIRMING_BOOKING', 'BOOKING_COMPLETED', 'SUPPORT_REQUESTED')`)]);
+}, (t) => [check("whatsapp_conversation_state", sql`${t.state} in ('MAIN_MENU', 'WAITING_FOR_NAME', 'WAITING_FOR_EMAIL', 'WAITING_FOR_CODE', 'CONFIRMING_NUMBER_REPLACEMENT', 'SELECTING_DATE', 'SELECTING_SLOT', 'CONFIRMING_BOOKING', 'BOOKING_COMPLETED', 'SUPPORT_REQUESTED', 'SELECTING_CANCELLATION', 'CONFIRMING_CANCELLATION')`)]);
 
 export const whatsappWebhookMessages = pgTable("whatsapp_webhook_messages", {
   messageId: text("message_id").primaryKey(),

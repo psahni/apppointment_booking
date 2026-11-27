@@ -3,15 +3,15 @@ import { randomUUID } from "node:crypto";
 import { and, asc, eq, gt, gte, lt, ne, sql } from "drizzle-orm";
 import type { BookingEvents } from "./events";
 import type { ApplicationDatabase } from "@/db/connection";
-import { patientSession, patientUser, staffAccess, staffSession } from "@/db/schema/auth";
+import { staffAccess, staffSession } from "@/db/schema/auth";
 import { appointments, bookingAudit, bookingRequests } from "@/db/schema/booking";
-import { whatsappPatientLinks } from "@/db/schema/notifications";
 import { doctorProfile } from "@/db/schema/clinic";
 import { dayOverrides, reservations } from "@/db/schema/scheduling";
 import { readClinicConfiguration } from "@/modules/clinic/repository";
 import type { ClinicPrincipal } from "@/modules/identity/access";
 import { clinicDate, dayBounds, generateSlots } from "@/modules/scheduling/engine";
 import type { ContactProtection } from "./contact-protection";
+import { verifiedPatientEmail } from "./access";
 import { BookingError, clinicBookingSchema, patientBookingSchema, type BookingActor, type BookingReceipt, type PatientContact, type WhatsAppBookingPrincipal } from "./models";
 
 type Transaction = Parameters<Parameters<ApplicationDatabase["transaction"]>[0]>[0];
@@ -34,21 +34,9 @@ async function assertActorActive(tx: Transaction, actor: BookingActor): Promise<
     if (!current || !["admin", "staff"].includes(current.role)) throw new BookingError(403, "ACCESS_DENIED", "Clinic booking access is not permitted.");
     return;
   }
-  if ("linkHash" in actor) {
-    const [linked] = await tx.select({ email: patientUser.email }).from(whatsappPatientLinks)
-      .innerJoin(patientUser, eq(patientUser.id, whatsappPatientLinks.patientUserId))
-      .where(and(eq(patientUser.id, actor.userId), eq(patientUser.email, actor.email),
-        eq(patientUser.emailVerified, true), eq(whatsappPatientLinks.linkHash, actor.linkHash)))
-      .for("share", { of: whatsappPatientLinks });
-    if (!linked) throw new BookingError(401, "SIGN_IN_REQUIRED", "Verify your email again to book an appointment.");
-    return linked.email;
-  }
-  const [current] = await tx.select({ email: patientUser.email }).from(patientSession)
-    .innerJoin(patientUser, eq(patientUser.id, patientSession.userId))
-    .where(and(eq(patientSession.id, actor.sessionId), eq(patientSession.userId, actor.userId),
-      gt(patientSession.expiresAt, sql`clock_timestamp()`), eq(patientUser.emailVerified, true)));
-  if (!current) throw new BookingError(401, "SIGN_IN_REQUIRED", "Sign in with a verified email to book an appointment.");
-  return current.email;
+  const email = await verifiedPatientEmail(tx, actor);
+  if (!email) throw new BookingError(401, "SIGN_IN_REQUIRED", "Sign in with a verified email to book an appointment.");
+  return email;
 }
 
 function isOverlapError(error: unknown) {

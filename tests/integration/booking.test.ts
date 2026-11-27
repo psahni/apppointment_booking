@@ -340,10 +340,117 @@ describe("WhatsApp conversational booking", () => {
     }
     expect(await inbound("menu")).toMatchObject({ state: "BOOKING_COMPLETED", reply: { type: "buttons" } });
     expect((await inbound("contact_support"))?.reply.body).toContain("+911234567890");
-    expect((await inbound("Cancel my appointment"))?.reply.body).toContain("My appointments");
+    expect(await inbound("Cancel my appointment")).toMatchObject({
+      state: "CONFIRMING_CANCELLATION", reply: { type: "buttons", body: expect.stringContaining("Cancel your appointment") },
+    });
+    await inbound("keep_appointment");
     const doctor = createDoctorAppointmentsService(database.db, identity.access, () => protection, clock);
     await doctor.cancel(credentials.admin, doctorInput(appointment.id));
     expect(await inbound("Hi")).toMatchObject({ state: "MAIN_MENU", reply: { type: "buttons" } });
+  });
+
+  it("offers cancellation only after identifying a patient with an upcoming appointment", async () => {
+    const flow = whatsappConversation("+919899999971");
+    const appointment = await service.bookPatient(credentials.patient, input());
+    const cancelButton = { id: "cancel_appointment", title: "Cancel appointment" };
+    const menu = { type: "buttons", buttons: expect.arrayContaining([cancelButton]) };
+    expect((await flow.message("Hi"))?.reply).not.toMatchObject(menu);
+    expect(await flow.message("Cancel my last appointment")).toMatchObject({ state: "WAITING_FOR_EMAIL" });
+    expect(await flow.message(adminEmail)).toMatchObject({ state: "WAITING_FOR_CODE" });
+    expect((await flow.message("0000"))?.reply.body).toContain("Cancel your appointment");
+    expect((await flow.message("keep_appointment"))?.reply).toMatchObject(menu);
+    expect((await flow.message("Hi"))?.reply).toMatchObject(menu);
+    expect((await flow.message(cancelButton.id))?.state).toBe("CONFIRMING_CANCELLATION");
+    const [saved] = await database.db.select().from(appointments).where(eq(appointments.id, appointment.id));
+    expect(saved.status).toBe("confirmed");
+
+    const empty = whatsappConversation("+919899999972");
+    await empty.message("Cancel my last appointment");
+    await empty.message(`empty-${randomUUID()}@example.test`);
+    expect(await empty.message("0000")).toMatchObject({ state: "MAIN_MENU", reply: {
+      type: "buttons", body: "You don’t have any upcoming appointments to cancel.",
+    } });
+    expect((await empty.message("Hi"))?.reply).not.toMatchObject(menu);
+  });
+
+  it("reuses a linked identity, limits the choices to owned future appointments, and safely retries a failed reply", async () => {
+    const phone = "+919899999973";
+    let instant = new Date(now);
+    const flow = whatsappConversation(phone, () => instant);
+    const first = await service.bookPatient(credentials.patient, input());
+    const second = await service.bookPatient(credentials.patient, input("2026-11-11T09:00:00Z"));
+    const other = await service.bookPatient(credentials.other, input("2026-11-11T09:20:00Z"));
+    await flow.message("Cancel my last appointment");
+    await flow.message(adminEmail);
+    expect((await flow.message("0000"))?.state).toBe("SELECTING_CANCELLATION");
+    instant = new Date(instant.getTime() + 31 * 60_000);
+    await flow.message("Cancel my last appointment");
+    const choices = await flow.message(adminEmail);
+    const expectedIds = [first, second].map(({ id }) => `C:SELECT:${id}`);
+    expect(choices?.state).toBe("SELECTING_CANCELLATION");
+    expect(choices?.reply.type === "list" && choices.reply.rows.map(({ id }) => id)).toEqual(expectedIds);
+    expect((await flow.message(`C:SELECT:${other.id}`))?.reply.type).toBe("list");
+
+    function confirmId(reply: Awaited<ReturnType<typeof flow.message>>) {
+      return reply?.reply.type === "buttons" ? reply.reply.buttons.find(({ id }) => id.startsWith("C:CONFIRM:"))!.id : "";
+    }
+    const stale = confirmId(await flow.message(expectedIds[0]));
+    await flow.message("keep_appointment");
+    await flow.message("Cancel my last appointment");
+    const active = confirmId(await flow.message(expectedIds[1]));
+    expect(active).not.toBe(stale);
+    expect((await flow.message(stale))?.state).toBe("CONFIRMING_CANCELLATION");
+    const inboundId = randomUUID();
+    flow.send.mockRejectedValueOnce(new Error("META_TEMPORARY_FAILURE"));
+    await expect(flow.message(active, inboundId)).rejects.toThrow("WHATSAPP_REPLY_FAILED");
+    expect(await flow.message(active, inboundId)).toBeNull();
+    expect(flow.send).toHaveBeenLastCalledWith(phone, expect.objectContaining({ body: "Your appointment has been cancelled." }));
+    const visits = await database.db.select({ id: appointments.id, status: appointments.status,
+      reservationId: appointments.reservationId }).from(appointments);
+    expect(visits).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: first.id, status: "confirmed" }),
+      expect.objectContaining({ id: second.id, status: "cancelled", reservationId: null }),
+      expect.objectContaining({ id: other.id, status: "confirmed" }),
+    ]));
+    const audits = await database.db.select().from(bookingAudit).where(and(eq(bookingAudit.appointmentId, second.id), eq(bookingAudit.action, "cancelled")));
+    expect(audits).toMatchObject([{ actorKind: "patient", actorId: patientId }]);
+    expect(await database.db.select().from(whatsappNotifications).where(eq(whatsappNotifications.appointmentId, second.id))).toHaveLength(0);
+  });
+
+  it("rechecks stale identity and eligibility before cancelling in WhatsApp", async () => {
+    const flow = whatsappConversation("+919899999974");
+    const appointment = await service.bookPatient(credentials.patient, input());
+    now = new Date(new Date(appointment.startsAt).getTime() - 60_000);
+    await flow.message("cancel my appointment");
+    await flow.message(adminEmail);
+    const selected = await flow.message("0000");
+    const confirm = selected?.reply.type === "buttons" ? selected.reply.buttons[1].id : "";
+    await database.db.delete(whatsappPatientLinks).where(eq(whatsappPatientLinks.patientUserId, patientId));
+    expect((await flow.message(confirm))?.state).toBe("WAITING_FOR_EMAIL");
+    expect((await database.db.select().from(appointments).where(eq(appointments.id, appointment.id)))[0].status).toBe("confirmed");
+
+    await flow.message(adminEmail);
+    const second = await flow.message("0000");
+    const confirmAgain = second?.reply.type === "buttons" ? second.reply.buttons[1].id : "";
+    now = new Date(appointment.startsAt);
+    expect((await flow.message(confirmAgain))?.reply.body).toContain("can no longer be cancelled");
+    expect((await database.db.select().from(appointments).where(eq(appointments.id, appointment.id)))[0].status).toBe("confirmed");
+  });
+
+  it("serializes simultaneous cancellations from WhatsApp and the website", async () => {
+    const flow = whatsappConversation("+919899999975");
+    const appointment = await service.bookPatient(credentials.patient, input());
+    await flow.message("cancel my appointment");
+    await flow.message(adminEmail);
+    const selected = await flow.message("0000");
+    const confirm = selected?.reply.type === "buttons" ? selected.reply.buttons[1].id : "";
+    const [chat, web] = await Promise.all([
+      flow.message(confirm),
+      cancellationService().cancel(credentials.patient, { appointmentId: appointment.id }),
+    ]);
+    expect(chat?.reply.body).toBe("Your appointment has been cancelled.");
+    expect(web).toEqual({ id: appointment.id, status: "cancelled" });
+    expect(await counts()).toEqual([1, 0, 2, 1]);
   });
 
   it("queues one post-commit cancellation notice only for an opted-in verified WhatsApp number", async () => {
