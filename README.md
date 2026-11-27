@@ -133,7 +133,20 @@ curl -i -X POST http://localhost:3000/api/webhooks/whatsapp \
   -H 'Content-Type: application/json' --data-binary "$payload"
 ```
 
-Complete the chat with the configured synthetic WhatsApp test recipient: send **Hi**, select booking, enter a synthetic name and email, read the generated code in `.local/email-preview.log`, then choose a date/time. The final prompt offers WhatsApp updates or confirmation only. The booking confirmation reply is sent only after the booking transaction commits. Cancellation notifications are queued atomically only for a WhatsApp-origin booking with active consent; configure an approved `WHATSAPP_CANCELLATION_TEMPLATE_NAME`/language template with body parameters for appointment time and timezone. With worker mode enabled, run `pnpm worker:whatsapp --watch`; with `WHATSAPP_USE_WORKER=false`, a cancellation request makes one bounded post-commit attempt. Meta acceptance is recorded as acceptance, not delivery. No external account setup, real email, paid provisioning or deployment is performed by this code.
+Complete the chat with the configured synthetic WhatsApp test recipient: send **Hi**, select booking, enter a synthetic name and email, read the generated code in `.local/email-preview.log`, then choose a date/time. The final prompt offers WhatsApp updates or confirmation only. The booking confirmation reply is sent only after the booking transaction commits. Cancellation notifications are queued atomically only for a WhatsApp-origin booking with active consent. With worker mode enabled, run `pnpm worker:whatsapp --watch`; with `WHATSAPP_USE_WORKER=false`, a cancellation request makes one bounded post-commit attempt. Meta acceptance is recorded as acceptance, not delivery. No external account setup, real email, paid provisioning or deployment is performed by this code.
+
+### Create the WhatsApp cancellation template
+
+Meta requires an approved template when the clinic starts a WhatsApp conversation or messages a patient outside the 24-hour window after the patient's last message. The app uses this template for every cancellation notice because the doctor can cancel after that window closes. Immediate booking confirmations in the WhatsApp chat use a regular reply. [WhatsApp Business Messaging Policy](https://whatsappbusiness.com/policy/)
+
+1. Open [WhatsApp Manager](https://business.facebook.com/wa/manage/message-templates/) and select the account that owns the app's sender number.
+2. Go to **Message templates → Manage templates → Create Template**. Select **Utility → Default → Next**.
+3. Name it `appointment_cancelled`, select **English (US)**, and paste this body:
+
+   > Your clinic appointment scheduled for {{1}} ({{2}}) has been cancelled. Please contact the clinic if you would like to book another appointment.
+
+4. Enter sample values `26 Nov 2026, 15:30` for `{{1}}` (appointment date and time) and `Europe/London` for `{{2}}` (timezone). Select **Submit for Review**.
+5. Wait for **Active**. The app defaults are `WHATSAPP_CANCELLATION_TEMPLATE_NAME=appointment_cancelled` and `WHATSAPP_CANCELLATION_TEMPLATE_LANGUAGE=en_US`. Book a new demo appointment in WhatsApp, opt in to updates, cancel it as the doctor, and check the patient's chat.
 
 ## Local clinic booking email preview
 
