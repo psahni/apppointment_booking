@@ -358,9 +358,15 @@ describe("WhatsApp conversational booking", () => {
     expect(await flow.message("Cancel my last appointment")).toMatchObject({ state: "WAITING_FOR_EMAIL" });
     expect(await flow.message(adminEmail)).toMatchObject({ state: "WAITING_FOR_CODE" });
     expect((await flow.message("0000"))?.reply.body).toContain("Cancel your appointment");
-    expect((await flow.message("keep_appointment"))?.reply).toMatchObject(menu);
+    expect((await flow.message("Keep appointment"))?.reply).toMatchObject({
+      ...menu, body: "Cancellation stopped. I didn’t cancel your appointment.",
+    });
     expect((await flow.message("Hi"))?.reply).toMatchObject(menu);
     expect((await flow.message(cancelButton.id))?.state).toBe("CONFIRMING_CANCELLATION");
+    expect((await flow.message("K**eep appointment**"))?.reply).toMatchObject({
+      ...menu, body: "Cancellation stopped. I didn’t cancel your appointment.",
+    });
+    expect((await flow.message("Keep appointment"))?.reply.body).toContain("no cancellation in progress");
     const [saved] = await database.db.select().from(appointments).where(eq(appointments.id, appointment.id));
     expect(saved.status).toBe("confirmed");
 
