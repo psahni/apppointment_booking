@@ -6,7 +6,7 @@ import { emailOTP } from "better-auth/plugins/email-otp";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { and, eq } from "drizzle-orm";
 import type { ApplicationDatabase } from "@/db/connection";
-import { patientAuthTables, staffAuthTables, staffAccess, staffUser } from "@/db/schema/auth";
+import { mapleDemoVerification, patientAuthTables, staffAuthTables, staffAccess, staffUser } from "@/db/schema/auth";
 import type { AuthMailer } from "@/platform/mail";
 import { adminPinPlugin } from "./admin-pin-plugin";
 import { resolveTestAuthMode, TEST_LOGIN_CODE } from "./test-mode";
@@ -52,14 +52,16 @@ export function createIdentity({ db, baseURL, patientSecret, staffSecret, mailer
     appName: "Nuvortiq Patient",
     secret: patientSecret,
     basePath: "/api/auth/patient",
-    database: drizzleAdapter(db, { provider: "pg", schema: patientAuthTables }),
+    database: drizzleAdapter(db, { provider: "pg", schema: patientDemoMode
+      ? { ...patientAuthTables, verification: mapleDemoVerification }
+      : patientAuthTables }),
     advanced: { cookiePrefix: "nuvortiq-patient", useSecureCookies: baseURL.startsWith("https:") },
     emailAndPassword: { enabled: false },
     hooks: { before: createAuthMiddleware(async (ctx) => {
       const requesting = ctx.path === "/email-otp/send-verification-otp" && ctx.body?.type === "sign-in";
       if (!requesting && ctx.path !== "/sign-in/email-otp") return;
       const address = typeof ctx.body?.email === "string" ? ctx.body.email.trim().toLowerCase() : "";
-      if (patientDemoMode !== isMapleDemoPatient(address)) throw new APIError("FORBIDDEN", { message: "This account cannot sign in here." });
+      if (patientDemoMode && !isMapleDemoPatient(address)) throw new APIError("FORBIDDEN", { message: "This account cannot sign in here." });
       if (!requesting || !address) return;
       // Replace the previous code so a resend cannot leave stale attempt counters
       // in front of the new code. The auth router applies request limits first.

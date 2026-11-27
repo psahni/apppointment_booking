@@ -40,15 +40,19 @@ function authTables(schema: PgSchema) {
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   });
-  const verification = schema.table("verification", {
+  const verification = schema.table("verification", verificationColumns());
+  return { user, session, account, verification };
+}
+
+function verificationColumns() {
+  return {
     id: text("id").primaryKey(),
     identifier: text("identifier").notNull(),
     value: text("value").notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-  });
-  return { user, session, account, verification };
+  };
 }
 
 export const patientAuthTables = authTables(patientAuthSchema);
@@ -58,6 +62,7 @@ export const patientUser = patientAuthTables.user;
 export const patientSession = patientAuthTables.session;
 export const patientAccount = patientAuthTables.account;
 export const patientVerification = patientAuthTables.verification;
+export const mapleDemoVerification = patientAuthSchema.table("maple_demo_verification", verificationColumns());
 export const staffUser = staffAuthTables.user;
 export const staffSession = staffAuthTables.session;
 export const staffAccount = staffAuthTables.account;

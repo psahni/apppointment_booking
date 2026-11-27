@@ -67,6 +67,23 @@ For localhost testing, explicitly set `AUTH_TEST_MODE=true`. An existing admin c
 
 The doctor/admin opens **Staff** from the workspace navigation (`/admin/staff`) to add a receptionist by name and email, list staff, or disable/re-enable access. Creation saves the clinic identity and staff access together; duplicate clinic emails are rejected. Patient identities remain separate even when the email matches. Disabling revokes existing sessions and pending login codes; re-enabling requires a fresh sign-in. No invitation email is sent. Active staff and the admin can open **Appointments** (`/admin/appointments`) for the clinic-local daily agenda and **Book appointment** (`/admin/book`) to select a time, enter patient name/email/phone, review and confirm. Selecting/discarding allocates no time; confirmation uses the shared transactional booking service. A lost response keeps the same request for retry; check the agenda before starting another booking. Clinic-created visits do not automatically link to a matching patient email or send WhatsApp messages. An optional local email simulation logs a redacted confirmation template; real email remains deferred. Staff may cancel any future confirmed clinic-created appointment with a required reason; admin retains patient-created cancellation, blocking and rebooking instructions. Staff cannot edit availability, settings or staff accounts. The agenda separates Confirmed and Cancelled tabs, preserving the selected date; completed/no-show records remain under Other history.
 
+## Maple Clinic patient demo (#51)
+
+Use the isolated Maple Clinic Neon preview database with synthetic data. From the PR branch, set `MIGRATION_DATABASE_URL` to that database's migration connection and `MAPLE_DEMO_DATABASE_URL` to a connection for the same database. Run:
+
+```sh
+pnpm db:migrate
+pnpm exec tsx scripts/seed-maple-demo.ts
+```
+
+The setup adds three patient accounts and two staff accounts (`reception@mapleclinic.example` and `staff@mapleclinic.example`). Rerunning it preserves existing accounts and bookings. If the app uses a separate runtime database role, give it access to the new `patient_auth.maple_demo_verification` table using the same privileges as the existing patient verification table.
+
+In Vercel, enable `PATIENT_DEMO_MODE=true` for the Maple Clinic preview branch you are testing. Set `APP_URL` to its HTTPS preview URL and check that `DATABASE_URL` points to the seeded Neon preview database. Redeploy the preview to apply those settings.
+
+1. Open `/login?next=/book`. Pick a sample patient, select **Continue**, enter the displayed code and book with dummy details.
+2. Sign out and try another sample patient. Check that the first patient's booking only appears under the first account. Try an incorrect code before the correct code and confirm that it is rejected.
+3. For a WhatsApp regression check, use the existing demo verification process for a new email/number pair. Start another booking from the same number with the same email and check that it goes straight to available dates. Website demo sign-in does not create a WhatsApp link.
+
 ## Checks
 
 ```sh

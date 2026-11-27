@@ -8,9 +8,18 @@ export const mapleDemoPatients = [
 
 export const mapleDemoCode = "462839";
 
+export const mapleDemoStaff = [
+  { name: "Maple Reception Demo", email: "reception@mapleclinic.example" },
+  { name: "Maple Staff Demo", email: "staff@mapleclinic.example" },
+];
+
 export function mapleDemoEnabled(source: Record<string, string | undefined> = process.env) {
-  return source.VERCEL_ENV === "preview" && source.PATIENT_DEMO_MODE === "true" &&
-    (source.APP_URL === previewOrigin || source.APP_URL === `${previewOrigin}/`);
+  if (source.VERCEL_ENV !== "preview" || source.PATIENT_DEMO_MODE !== "true" || !source.APP_URL) return false;
+  const origin = source.APP_URL.replace(/\/$/, "");
+  if (origin === previewOrigin) return true;
+  return source.VERCEL_GIT_COMMIT_REF === "feat/maple-patient-demo" &&
+    [source.VERCEL_BRANCH_URL, source.VERCEL_URL].some((host) =>
+      host?.endsWith(".vercel.app") && origin === `https://${host}`);
 }
 
 export function isMapleDemoPatient(email: string) {
