@@ -169,6 +169,7 @@ export function createWhatsAppConversationService(
     }
 
     const normalized = incoming.trim(), command = normalized.toLowerCase();
+    const keepAppointment = command === "keep_appointment" || command.replace(/\*/g, "").replace(/\s+/g, " ") === "keep appointment";
     const showMenu = async () => {
       const principal = verifiedPrincipal(data);
       if (!principal) return menu();
@@ -218,11 +219,17 @@ export function createWhatsAppConversationService(
       }
     };
     let reply: ConversationMessage;
-    if (cancellationCommands.has(command) || (state === "BOOKING_COMPLETED" && command === "cancel")) {
+    if (keepAppointment) {
+      if (state === "SELECTING_CANCELLATION" || state === "CONFIRMING_CANCELLATION") {
+        delete data.cancellation;
+        state = "MAIN_MENU";
+        reply = { ...await showMenu(), body: "Cancellation stopped. I didn’t cancel your appointment." };
+      } else reply = text("There’s no cancellation in progress. Send Menu to see your options.");
+    } else if (cancellationCommands.has(command) || (state === "BOOKING_COMPLETED" && command === "cancel")) {
       reply = await openCancellation();
     } else if (state === "SELECTING_CANCELLATION" || state === "CONFIRMING_CANCELLATION") {
       const principal = verifiedPrincipal(data);
-      if (greetings.has(command) || ["cancel", "restart", "start over", "keep_appointment"].includes(command)) {
+      if (greetings.has(command) || ["cancel", "restart", "start over"].includes(command)) {
         delete data.cancellation;
         state = "MAIN_MENU";
         reply = await showMenu();
