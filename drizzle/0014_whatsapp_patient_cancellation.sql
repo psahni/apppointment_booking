@@ -1,0 +1,2 @@
+ALTER TABLE "whatsapp_conversations" DROP CONSTRAINT "whatsapp_conversation_state";--> statement-breakpoint
+ALTER TABLE "whatsapp_conversations" ADD CONSTRAINT "whatsapp_conversation_state" CHECK ("whatsapp_conversations"."state" in ('MAIN_MENU', 'WAITING_FOR_NAME', 'WAITING_FOR_EMAIL', 'WAITING_FOR_CODE', 'CONFIRMING_NUMBER_REPLACEMENT', 'SELECTING_DATE', 'SELECTING_SLOT', 'CONFIRMING_BOOKING', 'BOOKING_COMPLETED', 'SUPPORT_REQUESTED', 'SELECTING_CANCELLATION', 'CONFIRMING_CANCELLATION'));

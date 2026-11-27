@@ -7,15 +7,18 @@ import { appointments, bookingRequests } from "@/db/schema/booking";
 import { whatsappConversations, whatsappPatientLinks, whatsappWebhookMessages } from "@/db/schema/notifications";
 import { readClinicConfiguration } from "@/modules/clinic/repository";
 import { BookingError, type WhatsAppBookingPrincipal } from "@/modules/booking/models";
+import { cancelWhatsAppAppointment, readWhatsAppCancellableAppointments } from "@/modules/booking/patient-cancellation";
 import type { createBookingService } from "@/modules/booking/service";
 import type { createSlotAvailabilityService } from "@/modules/scheduling/slots";
 import { createWhatsAppConversationVault } from "./conversation-vault";
-import type { ConversationMessage, ConversationSender } from "./meta-conversation";
+import { MetaConversationSendError, type ConversationMessage, type ConversationSender } from "./meta-conversation";
 
 const emailSchema = z.string().trim().toLowerCase().max(254).pipe(z.email());
 const nameSchema = z.string().trim().min(1).max(100).refine((value) => !/[\u0000-\u001f\u007f]/u.test(value));
-type State = "MAIN_MENU" | "WAITING_FOR_NAME" | "WAITING_FOR_EMAIL" | "WAITING_FOR_CODE" | "CONFIRMING_NUMBER_REPLACEMENT" | "SELECTING_DATE" | "SELECTING_SLOT" | "CONFIRMING_BOOKING" | "BOOKING_COMPLETED" | "SUPPORT_REQUESTED";
-type Data = { phone: string; name?: string; email?: string; patientUserId?: string; patientSessionId?: string; linkHash?: string; previousLinkHash?: string; date?: string; dateNextCursor?: string; startsAt?: string; requestId?: string; slotPage?: number; lastInboundId?: string; lastReply?: ConversationMessage; };
+type State = "MAIN_MENU" | "WAITING_FOR_NAME" | "WAITING_FOR_EMAIL" | "WAITING_FOR_CODE" | "CONFIRMING_NUMBER_REPLACEMENT" | "SELECTING_DATE" | "SELECTING_SLOT" | "CONFIRMING_BOOKING" | "BOOKING_COMPLETED" | "SUPPORT_REQUESTED" | "SELECTING_CANCELLATION" | "CONFIRMING_CANCELLATION";
+type Data = { phone: string; name?: string; email?: string; patientUserId?: string; patientSessionId?: string; linkHash?: string; previousLinkHash?: string; date?: string; dateNextCursor?: string; startsAt?: string; requestId?: string; slotPage?: number; lastInboundId?: string; lastReply?: ConversationMessage;
+  intent?: "cancel"; cancellationOffset?: number; cancellation?: { appointmentId: string; confirmationId: string };
+};
 type PatientAuthApi = {
   api: {
     sendVerificationOTP(input: { body: { email: string; type: "sign-in" } }): Promise<unknown>;
@@ -27,10 +30,16 @@ type Slots = Pick<ReturnType<typeof createSlotAvailabilityService>, "read">;
 const DAY_MS = 86_400_000;
 type Transaction = Parameters<Parameters<ApplicationDatabase["transaction"]>[0]>[0];
 const SESSION_MS = 30 * 60_000;
+const CANCELLATION_PAGE_SIZE = 9;
+// Match a complete, affirmative request. A match opens the flow and never confirms a cancellation.
+const cancellationRequest = /^(?:(?:i (?:want|need|would like) to|i['’]d like to|(?:can|could|would) (?:i|you)) )?(?:please )?cancel(?: (?:(?:my|the|an?) )?(?:(?:last|next|upcoming) )?appointment)?(?: please)?$/;
+const greetings = new Set(["hi", "hello", "hey", "menu", "start"]);
+type CancellableAppointment = Awaited<ReturnType<typeof readWhatsAppCancellableAppointments>>[number];
 
-function menu(): ConversationMessage {
+function menu(canCancel = false): ConversationMessage {
   return { type: "buttons", body: "Welcome to Nuvortiq Clinic. What would you like to do?", buttons: [
     { id: "book", title: "Book appointment" }, { id: "support", title: "Contact support" },
+    ...(canCancel ? [{ id: "cancel_appointment", title: "Cancel appointment" }] : []),
   ] };
 }
 function text(body: string): ConversationMessage { return { type: "text", body }; }
@@ -150,35 +159,143 @@ export function createWhatsAppConversationService(
       if (data.lastInboundId !== messageId || !data.lastReply) return null;
       return { state, data, reply: data.lastReply, duplicate: true };
     }
-    if (row.expiresAt <= now && state !== "BOOKING_COMPLETED") {
-      state = "MAIN_MENU";
-      data = { phone };
+    if (row.expiresAt <= now) {
+      if (state === "BOOKING_COMPLETED") {
+        delete data.linkHash;
+        delete data.patientSessionId;
+      } else {
+        state = "MAIN_MENU";
+        data = { phone };
+      }
     }
 
     const normalized = incoming.trim(), command = normalized.toLowerCase();
+    const cancellationCommand = command.replace(/[.!?]+$/, "").trimEnd().replace(/\s+/g, " ");
+    const bareCancel = cancellationCommand === "cancel";
+    const wantsCancellation = command === "cancel_appointment" ||
+      ((!bareCancel || state === "BOOKING_COMPLETED") && cancellationRequest.test(cancellationCommand));
+    const keepAppointment = command === "keep_appointment" || command.replace(/\*/g, "").replace(/\s+/g, " ") === "keep appointment";
+    const showMenu = async () => {
+      const principal = verifiedPrincipal(data);
+      if (!principal) return menu();
+      try { return menu((await readWhatsAppCancellableAppointments(tx, principal, now)).length > 0); }
+      catch (error) {
+        if (error instanceof BookingError && error.code === "SIGN_IN_REQUIRED") return menu();
+        throw error;
+      }
+    };
+    const askCancellationEmail = () => {
+      data = { phone, intent: "cancel" };
+      state = "WAITING_FOR_EMAIL";
+      return text("Enter the email address you used to book. Send Menu to go back.");
+    };
+    const confirmCancellation = (appointment: CancellableAppointment): ConversationMessage => {
+      const confirmationId = uuid();
+      data.cancellation = { appointmentId: appointment.id, confirmationId };
+      state = "CONFIRMING_CANCELLATION";
+      return { type: "buttons", body: `Cancel your appointment on ${shortTime(appointment.startsAt.toISOString(), appointment.timezone)} (${appointment.timezone})?`,
+        buttons: [{ id: "keep_appointment", title: "Keep appointment" }, { id: `C:CONFIRM:${confirmationId}`, title: "Confirm cancellation" }] };
+    };
+    const openCancellation = async (offset = 0): Promise<ConversationMessage> => {
+      const principal = verifiedPrincipal(data);
+      if (!principal) return askCancellationEmail();
+      delete data.intent;
+      delete data.cancellation;
+      try {
+        const choices = await readWhatsAppCancellableAppointments(tx, principal, now, { offset, limit: CANCELLATION_PAGE_SIZE + 1 });
+        if (!choices.length && offset > 0) return openCancellation();
+        if (!choices.length) {
+          state = "MAIN_MENU";
+          return { type: "buttons", body: "You don’t have any upcoming appointments to cancel.",
+            buttons: [{ id: "book", title: "Book appointment" }, { id: "menu", title: "Back to menu" }] };
+        }
+        if (offset === 0 && choices.length === 1) return confirmCancellation(choices[0]);
+        state = "SELECTING_CANCELLATION";
+        data.cancellationOffset = offset;
+        const rows = choices.slice(0, CANCELLATION_PAGE_SIZE).map((choice) => ({
+          id: `C:SELECT:${choice.id}`, title: shortTime(choice.startsAt.toISOString(), choice.timezone), description: choice.timezone,
+        }));
+        if (choices.length > CANCELLATION_PAGE_SIZE) rows.push({ id: "C:MORE", title: "More appointments", description: "" });
+        return { type: "list", body: "Choose the appointment you want to cancel. Send Menu to go back.",
+          button: "View appointments", section: "Upcoming appointments", rows };
+      } catch (error) {
+        if (error instanceof BookingError && error.code === "SIGN_IN_REQUIRED") return askCancellationEmail();
+        throw error;
+      }
+    };
     let reply: ConversationMessage;
-    if (state === "BOOKING_COMPLETED") {
+    if (keepAppointment) {
+      if (state === "SELECTING_CANCELLATION" || state === "CONFIRMING_CANCELLATION") {
+        delete data.cancellation;
+        state = "MAIN_MENU";
+        reply = { ...await showMenu(), body: "Cancellation stopped. I didn’t cancel your appointment." };
+      } else reply = text("There’s no cancellation in progress. Send Menu to see your options.");
+    } else if (wantsCancellation) {
+      reply = await openCancellation();
+    } else if (state === "SELECTING_CANCELLATION" || state === "CONFIRMING_CANCELLATION") {
+      const principal = verifiedPrincipal(data);
+      if (bareCancel || greetings.has(command) || ["restart", "start over"].includes(command)) {
+        delete data.cancellation;
+        state = "MAIN_MENU";
+        reply = await showMenu();
+      } else if (/^\d{4,6}$/.test(normalized)) return null;
+      else if (!principal) reply = askCancellationEmail();
+      else if (state === "SELECTING_CANCELLATION" && normalized === "C:MORE") {
+        reply = await openCancellation((data.cancellationOffset ?? 0) + CANCELLATION_PAGE_SIZE);
+      } else if (state === "SELECTING_CANCELLATION" && normalized.startsWith("C:SELECT:")) {
+        const appointmentId = z.uuid().safeParse(normalized.slice("C:SELECT:".length));
+        try {
+          const [selected] = appointmentId.success
+            ? await readWhatsAppCancellableAppointments(tx, principal, now, { appointmentId: appointmentId.data })
+            : [];
+          reply = selected ? confirmCancellation(selected) : await openCancellation();
+        } catch (error) {
+          if (!(error instanceof BookingError) || error.code !== "SIGN_IN_REQUIRED") throw error;
+          reply = askCancellationEmail();
+        }
+      } else if (state === "CONFIRMING_CANCELLATION" && data.cancellation && normalized === `C:CONFIRM:${data.cancellation.confirmationId}`) {
+        try {
+          await cancelWhatsAppAppointment(tx, principal, data.cancellation.appointmentId, clock);
+          delete data.cancellation;
+          state = "MAIN_MENU";
+          reply = { type: "buttons", body: "Your appointment has been cancelled.",
+            buttons: [{ id: "book", title: "Book appointment" }, { id: "menu", title: "Back to menu" }] };
+        } catch (error) {
+          if (!(error instanceof BookingError)) throw error;
+          if (error.code === "SIGN_IN_REQUIRED") reply = askCancellationEmail();
+          else if (["APPOINTMENT_NOT_FOUND", "CANCELLATION_NOT_ALLOWED"].includes(error.code)) {
+            delete data.cancellation;
+            state = "MAIN_MENU";
+            reply = withClinicContact("This appointment can no longer be cancelled here.", await clinicContact());
+          } else throw error;
+        }
+      } else if (state === "SELECTING_CANCELLATION") reply = await openCancellation(data.cancellationOffset ?? 0);
+      else reply = text("Use the latest confirmation buttons to confirm cancellation or keep the appointment. Send Menu to go back.");
+    } else if (state === "BOOKING_COMPLETED") {
       const appointment = await completedAppointment(data);
       if (appointment?.status === "cancelled") {
-        state = "MAIN_MENU"; data = { phone }; reply = menu();
+        state = "MAIN_MENU"; reply = await showMenu();
       } else if (command === "book" || normalized === "book_appointment") {
         state = "WAITING_FOR_NAME"; data = { phone }; reply = text("What name should we use for your appointment? Send Cancel to return to the main menu.");
-      } else if (["cancel", "cancel appointment", "cancel my appointment", "cancel_booking"].includes(command)) {
+      } else if (command === "cancel_booking") {
         reply = withClinicContact("You can cancel your appointment in My appointments on the booking website or contact the clinic.", await clinicContact());
       } else if (normalized === "support" || normalized === "contact_support") {
         reply = await supportReply();
-      } else if (["hi", "hello", "hey", "menu", "start"].includes(command)) {
-        reply = menu();
+      } else if (greetings.has(command)) {
+        reply = await showMenu();
       } else {
         reply = withClinicContact(appointment?.status === "confirmed"
           ? confirmationBody({ ...appointment, startsAt: appointment.startsAt.toISOString() })
           : "Your booking is complete.", await clinicContact());
       }
-    } else if (["cancel", "restart", "menu", "start over"].includes(command) || normalized === "cancel_booking") {
+    } else if (command === "menu" || (greetings.has(command) && state !== "WAITING_FOR_NAME")) {
+      state = "MAIN_MENU";
+      data = { phone, email: data.email, patientUserId: data.patientUserId, linkHash: data.linkHash, patientSessionId: data.patientSessionId };
+      reply = await showMenu();
+    } else if (bareCancel || ["restart", "start over"].includes(command) || normalized === "cancel_booking") {
       state = "MAIN_MENU"; data = { phone }; reply = menu();
     } else if (state === "MAIN_MENU") {
-      if (command === "hi" || command === "hello" || command === "hey" || command === "menu" || command === "start") reply = menu();
-      else if (normalized === "book" || normalized === "book_appointment") { state = "WAITING_FOR_NAME"; reply = text("What name should we use for your appointment? Send Cancel to return to the main menu."); }
+      if (normalized === "book" || normalized === "book_appointment") { state = "WAITING_FOR_NAME"; data = { phone }; reply = text("What name should we use for your appointment? Send Cancel to return to the main menu."); }
       else if (normalized === "support" || normalized === "contact_support") {
         state = "SUPPORT_REQUESTED";
         reply = await supportReply();
@@ -200,13 +317,13 @@ export function createWhatsAppConversationService(
           .where(and(eq(patientUser.email, email.data), eq(patientUser.emailVerified, true),
             eq(whatsappPatientLinks.linkHash, linkHash)));
         if (linked) {
-          data = { phone, name: data.name, email: email.data, patientUserId: linked.userId, linkHash };
-          state = "SELECTING_DATE";
-          reply = await openDates(data);
+          data = { phone, name: data.name, intent: data.intent, email: email.data, patientUserId: linked.userId, linkHash };
+          if (data.intent === "cancel") reply = await openCancellation();
+          else { state = "SELECTING_DATE"; reply = await openDates(data); }
         } else {
           try {
             await patientAuth.api.sendVerificationOTP({ body: { email: email.data, type: "sign-in" } });
-            data = { phone, name: data.name, email: email.data };
+            data = { phone, name: data.name, intent: data.intent, email: email.data };
             state = "WAITING_FOR_CODE";
             reply = text("Enter the one-time verification code for that email within five minutes. Send Cancel to stop.");
           } catch { reply = text("Email verification is temporarily unavailable. Please try again later or contact the clinic."); }
@@ -225,7 +342,10 @@ export function createWhatsAppConversationService(
           const linkHash = vault.linkHash(phone, data.email);
           await tx.insert(whatsappPatientLinks).values({ patientUserId: session.userId, linkHash, verifiedAt: now }).onConflictDoNothing();
           const [link] = await tx.select().from(whatsappPatientLinks).where(eq(whatsappPatientLinks.patientUserId, session.userId));
-          if (link?.linkHash === linkHash) {
+          if (link?.linkHash === linkHash) data.linkHash = linkHash;
+          if (data.intent === "cancel") {
+            reply = await openCancellation();
+          } else if (link?.linkHash === linkHash) {
             state = "SELECTING_DATE";
             reply = await openDates(data);
           } else {
@@ -249,7 +369,8 @@ export function createWhatsAppConversationService(
             state = "WAITING_FOR_EMAIL";
             reply = text("Your verification is no longer current. Enter your email to verify again.");
           } else {
-            const [updated] = await tx.update(whatsappPatientLinks).set({ linkHash: vault.linkHash(phone, data.email), verifiedAt: now })
+            const replacementHash = vault.linkHash(phone, data.email);
+            const [updated] = await tx.update(whatsappPatientLinks).set({ linkHash: replacementHash, verifiedAt: now })
               .where(and(eq(whatsappPatientLinks.patientUserId, data.patientUserId), eq(whatsappPatientLinks.linkHash, data.previousLinkHash)))
               .returning({ userId: whatsappPatientLinks.patientUserId });
             if (!updated) {
@@ -257,6 +378,7 @@ export function createWhatsAppConversationService(
               state = "WAITING_FOR_EMAIL";
               reply = text("The linked number changed. Enter your email to verify again.");
             } else {
+              data.linkHash = replacementHash;
               state = "SELECTING_DATE";
               reply = await openDates(data);
             }
@@ -349,7 +471,10 @@ export function createWhatsAppConversationService(
     try { await sender.send(phone, reply); }
     catch (error) {
       const code = error instanceof Error && /^META_[A-Z_]+$/.test(error.message) ? error.message : "META_SEND_FAILED";
-      console.warn(`WhatsApp conversation reply could not be sent; sender=${senderHash.slice(0, 12)} code=${code}`);
+      const provider = error instanceof MetaConversationSendError
+        ? ` http=${error.httpStatus} meta_code=${error.providerCode ?? "unknown"} meta_subcode=${error.providerSubcode ?? "unknown"}`
+        : "";
+      console.warn(`WhatsApp conversation reply could not be sent; sender=${senderHash.slice(0, 12)} code=${code}${provider}`);
       throw new Error("WHATSAPP_REPLY_FAILED");
     }
     return duplicate ? null : { state, data, reply };
