@@ -35,6 +35,16 @@ export type ConversationMessage =
 
 export type ConversationSender = { send(to: string, message: ConversationMessage): Promise<void> };
 
+const providerErrorSchema = z.object({
+  error: z.object({ code: z.int().nonnegative(), error_subcode: z.int().nonnegative().optional() }),
+});
+
+export class MetaConversationSendError extends Error {
+  constructor(readonly httpStatus: number, readonly providerCode?: number, readonly providerSubcode?: number) {
+    super(httpStatus === 429 ? "META_RATE_LIMIT" : httpStatus >= 500 ? "META_TEMPORARY_FAILURE" : "META_REJECTED_MESSAGE");
+  }
+}
+
 export function createMetaConversationSender(config: ConversationMetaConfig, request: typeof fetch = fetch, timeoutMs = 8_000): ConversationSender {
   return { async send(to, message) {
     const interactive = message.type === "buttons" ? {
@@ -49,7 +59,11 @@ export function createMetaConversationSender(config: ConversationMetaConfig, req
       method: "POST", redirect: "error", signal: AbortSignal.timeout(timeoutMs),
       headers: { Authorization: `Bearer ${config.WHATSAPP_ACCESS_TOKEN}`, "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
-    if (!response.ok) throw new Error(response.status === 429 ? "META_RATE_LIMIT" : response.status >= 500 ? "META_TEMPORARY_FAILURE" : "META_REJECTED_MESSAGE");
+    if (!response.ok) {
+      const rejected = providerErrorSchema.safeParse(await response.json().catch(() => null));
+      const providerError = rejected.success ? rejected.data.error : undefined;
+      throw new MetaConversationSendError(response.status, providerError?.code, providerError?.error_subcode);
+    }
   } };
 }
 
@@ -71,7 +85,7 @@ export function createMetaCancellationSender(config: ConversationMetaConfig, req
         const parsed = z.object({ messages: z.array(z.object({ id: z.string().min(1).max(512) })).min(1) }).safeParse(data);
         return parsed.success ? { status: "accepted", apiMessageId: parsed.data.messages[0].id } : { status: "uncertain", errorCode: "INVALID_RESPONSE" };
       }
-      const parsed = z.object({ error: z.object({ code: z.number().int().nonnegative() }) }).safeParse(data);
+      const parsed = providerErrorSchema.safeParse(data);
       const errorCode = parsed.success ? `META_${parsed.data.error.code}` : `HTTP_${response.status}`;
       return response.status >= 400 && response.status < 500
         ? { status: "failed", errorCode, retryable: response.status === 429 }

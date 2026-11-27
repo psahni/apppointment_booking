@@ -55,4 +55,14 @@ describe("Meta WhatsApp conversation adapter", () => {
       expect(String(request.mock.calls[0][1]?.body)).not.toContain(config.WHATSAPP_ACCESS_TOKEN);
     }
   });
+  it("keeps only safe diagnostic fields from Meta's rejection", async () => {
+    const providerDetails = "private provider details";
+    const request = vi.fn<typeof fetch>().mockResolvedValue(Response.json({
+      error: { code: 190, error_subcode: 463, message: providerDetails },
+    }, { status: 401 }));
+    const sender = createMetaConversationSender(readConversationMetaConfig({ WHATSAPP_CONVERSATION_ENABLED: "true", ...config })!, request);
+    const result = await sender.send("+919876543210", { type: "text", body: "Hello" }).catch((error: unknown) => error);
+    expect(result).toMatchObject({ message: "META_REJECTED_MESSAGE", httpStatus: 401, providerCode: 190, providerSubcode: 463 });
+    expect(JSON.stringify(result)).not.toContain(providerDetails);
+  });
 });
