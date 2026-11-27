@@ -21,11 +21,11 @@ type AuthConfiguration = {
   staffSecret: string;
   mailer: AuthMailer;
   testMode?: boolean;
-  patientDemoMode?: boolean;
+  patientDemoMode?: "web" | "whatsapp";
 };
 
 /** Keep patient and clinic identities, credentials and session checks separate. */
-export function createIdentity({ db, baseURL, patientSecret, staffSecret, mailer, testMode = false, patientDemoMode = false }: AuthConfiguration) {
+export function createIdentity({ db, baseURL, patientSecret, staffSecret, mailer, testMode = false, patientDemoMode }: AuthConfiguration) {
   if (patientSecret === staffSecret || Math.min(patientSecret.length, staffSecret.length) < 32) {
     throw new Error("Distinct patient and staff authentication secrets of at least 32 characters are required.");
   }
@@ -52,7 +52,7 @@ export function createIdentity({ db, baseURL, patientSecret, staffSecret, mailer
     appName: "Nuvortiq Patient",
     secret: patientSecret,
     basePath: "/api/auth/patient",
-    database: drizzleAdapter(db, { provider: "pg", schema: patientDemoMode
+    database: drizzleAdapter(db, { provider: "pg", schema: patientDemoMode === "web"
       ? { ...patientAuthTables, verification: mapleDemoVerification }
       : patientAuthTables }),
     advanced: { cookiePrefix: "nuvortiq-patient", useSecureCookies: baseURL.startsWith("https:") },
@@ -71,7 +71,7 @@ export function createIdentity({ db, baseURL, patientSecret, staffSecret, mailer
       ...codeOptions,
       ...(patientDemoMode ? { generateOTP: () => mapleDemoCode } : {}),
       // Demo sign-in is restricted to seeded patients. Other modes retain verified signup.
-      disableSignUp: patientDemoMode,
+      disableSignUp: !!patientDemoMode,
       async sendVerificationOTP({ email, otp, type }) {
         if (type !== "sign-in") throw new Error("Unsupported patient verification request.");
         if (!testing && !patientDemoMode) await mailer.sendPatientLoginCode({ email, code: otp });
