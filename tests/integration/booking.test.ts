@@ -340,9 +340,10 @@ describe("WhatsApp conversational booking", () => {
     }
     expect(await inbound("menu")).toMatchObject({ state: "BOOKING_COMPLETED", reply: { type: "buttons" } });
     expect((await inbound("contact_support"))?.reply.body).toContain("+911234567890");
-    expect(await inbound("Cancel my appointment")).toMatchObject({
+    expect(await inbound("i want to cancel")).toMatchObject({
       state: "CONFIRMING_CANCELLATION", reply: { type: "buttons", body: expect.stringContaining("Cancel your appointment") },
     });
+    expect((await database.db.select().from(appointments).where(eq(appointments.id, appointment.id)))[0].status).toBe("confirmed");
     await inbound("keep_appointment");
     const doctor = createDoctorAppointmentsService(database.db, identity.access, () => protection, clock);
     await doctor.cancel(credentials.admin, doctorInput(appointment.id));
@@ -371,7 +372,7 @@ describe("WhatsApp conversational booking", () => {
     expect(saved.status).toBe("confirmed");
 
     const empty = whatsappConversation("+919899999972");
-    await empty.message("Cancel my last appointment");
+    expect((await empty.message("I want to cancel my appointment."))?.state).toBe("WAITING_FOR_EMAIL");
     await empty.message(`empty-${randomUUID()}@example.test`);
     expect(await empty.message("0000")).toMatchObject({ state: "MAIN_MENU", reply: {
       type: "buttons", body: "You don’t have any upcoming appointments to cancel.",
