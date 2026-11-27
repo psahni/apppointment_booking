@@ -31,7 +31,10 @@ const DAY_MS = 86_400_000;
 type Transaction = Parameters<Parameters<ApplicationDatabase["transaction"]>[0]>[0];
 const SESSION_MS = 30 * 60_000;
 const CANCELLATION_PAGE_SIZE = 9;
-const cancellationCommands = new Set(["cancel_appointment", "cancel an appointment", "cancel appointment", "cancel my appointment", "cancel my last appointment"]);
+const cancellationCommands = new Set([
+  "cancel_appointment", "cancel an appointment", "cancel appointment", "cancel my appointment", "cancel my last appointment",
+  "i want to cancel", "i want to cancel an appointment", "i want to cancel my appointment", "i want to cancel my last appointment",
+]);
 const greetings = new Set(["hi", "hello", "hey", "menu", "start"]);
 type CancellableAppointment = Awaited<ReturnType<typeof readWhatsAppCancellableAppointments>>[number];
 
@@ -169,6 +172,7 @@ export function createWhatsAppConversationService(
     }
 
     const normalized = incoming.trim(), command = normalized.toLowerCase();
+    const cancellationCommand = command.replace(/[.!?]+$/, "").trimEnd().replace(/\s+/g, " ");
     const keepAppointment = command === "keep_appointment" || command.replace(/\*/g, "").replace(/\s+/g, " ") === "keep appointment";
     const showMenu = async () => {
       const principal = verifiedPrincipal(data);
@@ -225,7 +229,7 @@ export function createWhatsAppConversationService(
         state = "MAIN_MENU";
         reply = { ...await showMenu(), body: "Cancellation stopped. I didn’t cancel your appointment." };
       } else reply = text("There’s no cancellation in progress. Send Menu to see your options.");
-    } else if (cancellationCommands.has(command) || (state === "BOOKING_COMPLETED" && command === "cancel")) {
+    } else if (cancellationCommands.has(cancellationCommand) || (state === "BOOKING_COMPLETED" && cancellationCommand === "cancel")) {
       reply = await openCancellation();
     } else if (state === "SELECTING_CANCELLATION" || state === "CONFIRMING_CANCELLATION") {
       const principal = verifiedPrincipal(data);
