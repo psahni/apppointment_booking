@@ -11,7 +11,7 @@ import { cancelWhatsAppAppointment, readWhatsAppCancellableAppointments } from "
 import type { createBookingService } from "@/modules/booking/service";
 import type { createSlotAvailabilityService } from "@/modules/scheduling/slots";
 import { createWhatsAppConversationVault } from "./conversation-vault";
-import type { ConversationMessage, ConversationSender } from "./meta-conversation";
+import { MetaConversationSendError, type ConversationMessage, type ConversationSender } from "./meta-conversation";
 
 const emailSchema = z.string().trim().toLowerCase().max(254).pipe(z.email());
 const nameSchema = z.string().trim().min(1).max(100).refine((value) => !/[\u0000-\u001f\u007f]/u.test(value));
@@ -466,7 +466,10 @@ export function createWhatsAppConversationService(
     try { await sender.send(phone, reply); }
     catch (error) {
       const code = error instanceof Error && /^META_[A-Z_]+$/.test(error.message) ? error.message : "META_SEND_FAILED";
-      console.warn(`WhatsApp conversation reply could not be sent; sender=${senderHash.slice(0, 12)} code=${code}`);
+      const provider = error instanceof MetaConversationSendError
+        ? ` http=${error.httpStatus} meta_code=${error.providerCode ?? "unknown"} meta_subcode=${error.providerSubcode ?? "unknown"}`
+        : "";
+      console.warn(`WhatsApp conversation reply could not be sent; sender=${senderHash.slice(0, 12)} code=${code}${provider}`);
       throw new Error("WHATSAPP_REPLY_FAILED");
     }
     return duplicate ? null : { state, data, reply };
